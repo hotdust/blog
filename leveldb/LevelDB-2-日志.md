@@ -29,7 +29,7 @@
 在本文中主要分析日志的结构、写入读取操作。
 
 # 日志文件
-日志文件有两个：一个是对应 memtable，一个是对应 immemtable。
+日志文件有两个：一个是对应 memtable，一个是对应 immutable memtable。
 ![leveldb_ls](media/leveldb_lsm.png)
 ![leveldb_localfs](media/leveldb_localfs.png)
 从上图可以看出，`000062.log`和`000064.log`对应两个 memtable。
@@ -100,7 +100,7 @@ singleWriter开始写入时，标志着第一个record开始写入。在写入�
 
 
 # 个人总结
-## 1，关于 memtable 和 immemtable
+## 1，关于 memtable 和 immutable memtable
 两个 memtable 这种模式，主要是为了能够不阻塞写操作。这种模式在 RocketMQ 中也有体现，在 CommitLog 接收消息写入处理时，接收到一定时间的消息后，就要处理这些消息。处理消息之前，准备另一个 queue 来接收`新的消息`。这样在处理`已经接收到的消息`时，不影响新的消息的接收。
 
 ## 2，写操作的原子性
@@ -109,38 +109,22 @@ singleWriter开始写入时，标志着第一个record开始写入。在写入�
 没有读代码，推断可能是这么做的：`在读到第 3 条数据出错的话，整个 Record 的数据都放弃掉，这样可以保证原子性`。但一般来说，在读取 block 时候，如果文件中内容写的不正确（因为停机一部分数据没有写到磁盘上），CRC 校验就会出错，会把这个 block 给放弃掉。
 
 
-## 3，当 block 无法容下 chunck 时
-当 block 无法容下 chunck 时，LevelDB 会把数据分成几份来保存。如果 block 的空间连一份数据中的 Header 部分都写不下的话，会以 0 进行填充。
+## 3，当 block 无法容下 record 时
+当 block 无法容下 record 时，LevelDB 会把数据分成几份来保存。如果 block 的空间连一份数据中的 Header 部分都写不下的话，会以 0 进行填充。
 
 RocketMQ 当写不下全部数据的时候，不会分成 first、middle、last，而是把剩余的空间设置成`空白消息`。因为 RocketMQ 每个日志文件都很大，可能这样做浪费的空间，小于为每个消息都加一个字段所占用的空间，所以设置成`空白`。
 
 如果 header 都写不下，RocketMQ 是 header 部分能写多少就写多少，就是为了把文件填满。然后会把数据保存到一个新文件上。但在启动后，数据恢复时可能会发生问题，在遇到上面那种`Header 都没有写完整`的文件后，因为在读取 header 时无法读取完整，会报异常，后面的文件都不会被恢复了。（不知道理解的对不对）
 
-## 4，日志文件如何保存
+## 4，日志文件的保存和删除
 在保存文件到磁盘时，是以每个 block 为单位保存的。如果不把 block 填满，就不会保存到磁盘上。从 block 的数据结构就可以看出，block 的第一个字段是保存`数据部分 CRC 校验值`。（这么做的话，可能存储在数据丢失的风险）
 
-
-todo总结===
-LevelDB 的日志是如何存储的？按大小分文件吗，还是按什么方式分文件？
-看上面有下面这样的说明，到底是如何存储的呢？
-```
-不可读的memory db，与此同时，与之对应的日志文件也变成一份frozen log。
-
-而新生成的immutable memory db则会由后台的minor compaction进程将其转换成一个sstable文件进行持久化，持久化完成，与之对应的frozen log被删除。
-```
+immutable memtable 则会由后台的minor compaction进程将其转换成一个sstable文件进行持久化，持久化完成，与之对应的日志被删除。
 
 
 
-Record 以 block 为单位组织（32k）。写日志时，一致性考虑，并没有以 block 为单位写，而是每次更新均对 log 文件进行 IO，根据 WriteOption::sync 决定是否做强制 sync。读取时以 block 为单位做 IO 以及校验。log 的写入是顺序写，读取只会在启动时发生，不会是性能的瓶颈。
-
-日志写入流程较为简单，在leveldb内部，实现了一个journal的writer。首先调用Next函数获取一个singleWriter，这个singleWriter的作用就是写入一条journal记录。
-
-singleWriter开始写入时，标志着第一个record开始写入。在写入的过程中，不断判断writer中buffer的大小，若超过32KB，将record开始到现在做为一个完整的record，为其计算header之后将整个block写入文件。与此同时reset buffer，开始新的record的写入。
-
-若一条journal记录较大，则可能会分成几个record存储在若干个block中。
-
-
-
-todo：
-1，说一下记录结构从大到小。
-2，说一下架构中，文件的名字，就是英文的那个图。
+# 参考：
+- [LevelDB的操作日志](https://codingstory.com/2012/07/11/leveldb-commit-log/)
+- [Leveldb_RTFSC](http://www.grakra.com/2017/06/17/Leveldb-RTFSC/)
+- [LevelDB：写操作](https://www.jianshu.com/p/8639b21cb802)
+ 
