@@ -12,6 +12,12 @@
 - [leveldb源码剖析](http://www.pandademo.com/category/tech/leveldb/)：还没具体看
 
 
+学习组件：
+- snapshot
+- 
+
+
+
 # 个人想法：
 1，既然 sstable 是不能修改的，sstable 使用 BTree 结构呢？
 BTree 有很多变形，例如：B+Tree、B*Tree。只要把数据部分放在一起，结点部分放在一起，保存到文件中，应该会不错。这样做：
