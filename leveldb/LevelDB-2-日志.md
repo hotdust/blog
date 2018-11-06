@@ -76,6 +76,7 @@ record共有四种类型：full，first，middle，last。一条日志记录若�
 
 紧接着写入所有 batch 编码后的内容。有关 batch 的编码规则，可以见 读写操作.
 
+> 在向 memtable 里写数据时，把 key 进行了扩展，变成 internal_key。但在写日志时，没有对接收到的数据进行任何扩展，原样的（head(sequence + count) + OP_N）放到了 Record 里。
 
 # 日志写
 ![journal_write](media/journal_write.jpg)
@@ -121,6 +122,14 @@ RocketMQ 当写不下全部数据的时候，不会分成 first、middle、last�
 
 immutable memtable 则会由后台的minor compaction进程将其转换成一个sstable文件进行持久化，持久化完成，与之对应的日志被删除。
 
+## 5，为什么使用 skiplist 做为数据结构，可不可以使用 Btree 等树做为
+BTree 有很多变形，例如：B+Tree、B*Tree。只要像下面这样保存到文件中。
+- 把数据部分放在一起，并且保证以 key 进行顺序存储
+- 结点部分放在一起。
+
+可能会有更好的性能，原因如下：
+- 可以保证 Compaction 时的归并排序的快速性。因为 skiplist 的数据是顺序存储的，在归并排序时非常快。BTree 也做成数据顺序存储，也可以非常快。
+- 还可以提高查询速度。因为 BTree 查询速度是 $log_{m}^{n}$，而 skiplist 是接近 $log_{2}^{n}$。
 
 
 # 参考：

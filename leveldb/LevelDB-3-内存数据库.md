@@ -144,12 +144,7 @@ memtable 接收到的数据格式和`日志`接收到的数据格式是一样的
 ![leveldb_log_payload](media/leveldb_log_payload.png)
 因为在使用 api 输入指令时，例如：`leveldb.Put("foo", "v1"); Put("foo", "v2")`，就把 key/value 保存成了上面的`header + op_n`的格式了。
 
-当要把数据保存到 memtable，memtable 会把 header 部分去掉，然后对 OP_N 部分进行循环处理，取得每一条数据，做成上 entry 的格式。
-
-1，在 memtable 接收到的是原始的 key/value，memtable 在加入 skiplist 前，把数据转成 entry 格式。
-数据组成也是 sequence, number, op1, op2
-2，
-
+当要把数据保存到 memtable，memtable 会把 header 部分去掉，然后对 OP_N 部分进行循环处理，取得每一条数据，做成上 entry 的格式，然后插入到 skiplist 中。
 
 
 ### 查询数据时的结构
@@ -193,27 +188,131 @@ nodeData中，每个跳表节点占用一段连续的存储空间，每一个字
 Put、Get、Delete、Iterator等操作均依赖于底层的跳表的基本操作实现，不再赘述。
 
 # 个人总结
-## 1，为什么使用 skiplist 做为数据结构
-因为 skiplist 的插入和删除操作比 balanced tree 快很多，这也是利于`大量写操作`的。
-todo 把时间复杂度什么的补全。
+## 1，关于内存数据库
+在内存数据库中，最重要的就是 skiplist 的实现了，因为它是 memtable 的核心逻辑。
 
+除此之外，还有一点就是 internal_key 了。在 skiplist 进行比较 key 时，是拿 internal_key 进行比较。sequence number 起到了版本控制作用。
 
-## 2，关于写
-写 memtable 时会使用 internal key，写 WAL 时应该不会使用 internal key.
+## 2，关于 varint 编码
+在保存 key 和 value 的 size 字段时，对 size 使用了 varint 编码，当 key 和 value 都不大时，可以节省一些空间。
 
+## 3，写 memtable 代码
+1，
+文件：db_impl.cc
+方法：`Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) `
+```
+if (status.ok()) {
+status = WriteBatchInternal::InsertInto(updates, mem_); // 向 memtable 写
+}
+```
 
-status = WriteBatchInternal::InsertInto(updates, mem_);
-
+2，
+文件：write_batch.cc
+方法：`Status WriteBatchInternal::InsertInto(const WriteBatch* b,
+                                      MemTable* memtable)`
+```
 Status WriteBatchInternal::InsertInto(const WriteBatch* b,
-handler->Put(key, value);
+                                      MemTable* memtable) {
+  MemTableInserter inserter;
+  inserter.sequence_ = WriteBatchInternal::Sequence(b);
+  inserter.mem_ = memtable;
+  return b->Iterate(&inserter); // 调用 inserter 进行写 memtable
+}
+```
 
+3，
+文件：write_batch.cc
+```
+Status WriteBatch::Iterate(Handler* handler) const {
+  Slice input(rep_);
+  if (input.size() < kHeader) {
+    return Status::Corruption("malformed WriteBatch (too small)");
+  }
 
+  input.remove_prefix(kHeader);
+  Slice key, value;
+  int found = 0;
+  while (!input.empty()) {
+    found++;
+    char tag = input[0];
+    input.remove_prefix(1);
+    switch (tag) {
+      case kTypeValue:
+        if (GetLengthPrefixedSlice(&input, &key) &&
+            GetLengthPrefixedSlice(&input, &value)) {
+          handler->Put(key, value); // 向 memtable 加一条 put 数据
+        } else {
+          return Status::Corruption("bad WriteBatch Put");
+        }
+        break;
+      case kTypeDeletion:
+        if (GetLengthPrefixedSlice(&input, &key)) {
+          handler->Delete(key); // 向 memtable 加一条 delete 数据
+        } else {
+          return Status::Corruption("bad WriteBatch Delete");
+        }
+        break;
+      default:
+        return Status::Corruption("unknown WriteBatch tag");
+    }
+  }
+  if (found != WriteBatchInternal::Count(this)) {
+    return Status::Corruption("WriteBatch has wrong count");
+  } else {
+    return Status::OK();
+  }
+}
+```
 
+4，
+文件：write_batch.cc
+```
 class MemTableInserter : public WriteBatch::Handler {
-mem_->Add(sequence_, kTypeValue, key, value);
+ public:
+  SequenceNumber sequence_;
+  MemTable* mem_;
 
+  virtual void Put(const Slice& key, const Slice& value) {
+    mem_->Add(sequence_, kTypeValue, key, value);
+    sequence_++;
+  }
+  virtual void Delete(const Slice& key) {
+    mem_->Add(sequence_, kTypeDeletion, key, Slice());
+    sequence_++;
+  }
+};
+```
 
+5，
+文件：memtable.cc
+```
+// 在这里进行 internal_key 的创建和保存。
 void MemTable::Add(SequenceNumber s, ValueType type,
+                   const Slice& key,
+                   const Slice& value) {
+  // Format of an entry is concatenation of:
+  //  key_size     : varint32 of internal_key.size()
+  //  key bytes    : char[internal_key.size()]
+  //  value_size   : varint32 of value.size()
+  //  value bytes  : char[value.size()]
+  size_t key_size = key.size();
+  size_t val_size = value.size();
+  size_t internal_key_size = key_size + 8;
+  const size_t encoded_len =
+      VarintLength(internal_key_size) + internal_key_size +
+      VarintLength(val_size) + val_size;
+  char* buf = arena_.Allocate(encoded_len);
+  char* p = EncodeVarint32(buf, internal_key_size);
+  memcpy(p, key.data(), key_size);
+  p += key_size;
+  EncodeFixed64(p, (s << 8) | type);
+  p += 8;
+  p = EncodeVarint32(p, val_size);
+  memcpy(p, value.data(), val_size);
+  assert(p + val_size == buf + encoded_len);
+  table_.Insert(buf);
+}
+```
 
 # 问题：
 1，sequence number 是如何使用的？在插入和查询时，都是如何取得这个值的？
@@ -223,51 +322,4 @@ void MemTable::Add(SequenceNumber s, ValueType type,
 - [MemTable与SkipList-leveldb源码剖析(3)](http://www.pandademo.com/2016/03/memtable-and-skiplist-leveldb-source-dissect-3/)：源码解析的文章，这篇文章有的图是从这里找的，有不明白可以去找找。
 - [Leveldb源码笔记之读操作](http://blog.1feng.me/2016/09/10/leveldb-read/)：源码解析的文章，这篇文章有的图是从这里找的，有不明白可以去找找。
 - [leveldb中的memtable](http://bean-li.github.io/leveldb-memtable/)：源码解析的文章，引用了上两篇文章中的图。
-
-
-
-
-
-=================
-spark 问题：
-1，接收器容错。从 kafka 中拉数据时，如何保证不丢失消息？如何保证不重复消费消息
- - [Spark Streaming 读取 Kafka 的各种姿势解析](https://www.ctolib.com/topics-123320.html)
- - [Spark Streaming读取Kafka数据](https://www.jianshu.com/p/8603ba4be007)
- - [spark streaming读取kafka示例](https://blog.csdn.net/xzj9581/article/details/79223826)
- - [何管理Spark Streaming消费Kafka的偏移量（三）](http://qindongliang.iteye.com/blog/2401194)
- - [Spark streaming接收Kafka数据](https://blog.csdn.net/bsf5521/article/details/76635867?locationNum=9&fps=1)
- - [官方文档](https://spark.apache.org/docs/latest/streaming-kafka-0-10-integration.html)
- - [Spark Streaming 管理 Kafka Offsets 的方式探讨](https://juejin.im/entry/5acd7224f265da237c693f7d)
- - [为什么 Spark Streaming + Kafka 无法保证 exactly once？](https://www.jianshu.com/p/27f91de7417d)
- - [Spark Streaming重复消费,多次输出问题剖析与解决方案](https://my.oschina.net/jfld/blog/671189)：这个也解决不重复问题
- - [spark streaming 从kafka 拉数据如何保证数据不丢失](http://coolplayer.net/2016/11/30/spark-streaming-%E4%BB%8Ekafka-%E6%8B%89%E6%95%B0%E6%8D%AE%E5%A6%82%E4%BD%95%E4%BF%9D%E8%AF%81%E6%95%B0%E6%8D%AE%E4%B8%8D%E4%B8%A2%E5%A4%B1/)
- - [SparkStreaming如何优雅的停止服务](http://qindongliang.iteye.com/blog/2364713)
- - [Offset Management For Apache Kafka With Apache Spark Streaming](http://blog.cloudera.com/blog/2017/06/offset-management-for-apache-kafka-with-apache-spark-streaming/)
- - [Spark Streaming + Kafka Integration Guide](https://spark.apache.org/docs/2.2.0/streaming-kafka-0-10-integration.html#storing-offsets)：官方的方法，不错。
-
-
-2，存储时候使用 foreachPartition
-- [Spark Streaming之妙用foreachRDD和foreachPartition](https://blog.csdn.net/u013709270/article/details/78857802)
-
-
-
-3，如何优雅关闭，不丢失消息。
- - [Spark Streaming优雅的关闭策略优化](http://qindongliang.iteye.com/blog/2404100)
-4，看一下 spark 原理，要不知道是如何动作的。
- - [Spark streaming 设计与实现剖析](https://mp.weixin.qq.com/s?__biz=MzI3MjY2MTYzMA==&mid=2247483758&idx=1&sn=acd78535a2398f7109087256f3a06b15&scene=21#wechat_redirect)
- - [spark 自己的分布式存储系统 - BlockManager](https://mp.weixin.qq.com/s?__biz=MzI3MjY2MTYzMA==&mid=2247483665&idx=1&sn=ba078a1b87036b199dd68a4988df788a&scene=21#wechat_redirect)
-
-5，查看 kafka offset 保存
-- [关于kafka更改消费者对应分组下的offset值](http://blog.51cto.com/13639264/2135877)
-
-6，
-[Spark踩坑记——Spark Streaming+Kafka](https://www.cnblogs.com/xlturing/p/6246538.html)：关于 kafka 接收和发送的做法，还有调优
-
-7，如何测试 spark streaming widow:[spark streaming的基于window的测试例子](http://blog.coder100.com/?p=155)
-
-
-spark 优化：https://spark.apache.org/docs/latest/tuning.html
-
-spark 官方例子：
-https://github.com/apache/spark/tree/v2.3.1/examples/src/main/java/org/apache/spark/examples/streaming
-
+- [LevelDB：写操作](https://www.jianshu.com/p/8639b21cb802)：简单介绍写的主要流程，并指明是哪行代码，方便理解。
