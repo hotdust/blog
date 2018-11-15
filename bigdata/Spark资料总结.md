@@ -72,7 +72,9 @@ https://blog.csdn.net/qq_31806205/article/details/80451743
 ## 6，spark 设置 hadoop 等配置方法
 
 **1，在程序内部设置（测试过）**
-sparkConf.set("spark.hadoop.dfs.replication", "1");
+> sparkConf.set("spark.hadoop.dfs.replication", "1");
+
+好像只能 hadoop 能这么设置的（"spark.hadoop." + hdfs-site.xml 具体项目），别可能不行。原因：[How can I change HDFS replication factor for my Spark program?](https://stackoverflow.com/questions/46098118/how-can-i-change-hdfs-replication-factor-for-my-spark-program) 文章最下面的答案。
 
 **2，命令行设置（没有测试过）**
 spark-submit --conf spark.hadoop.fs.s3a.access.key=value
