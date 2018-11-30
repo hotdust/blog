@@ -11,7 +11,7 @@ Compaction 主要分为两种：
 # Minor Compaction
 一次 Minor compaction 非常简单，其本质就是将一个内存数据库中的所有数据持久化到一个磁盘文件中。
 
-## 触发条件
+## Minor Compaction 触发条件
 触发条件这里有点复杂，触发条件分为两种场景：
 - 恢复时触发
 - 运行中触发
@@ -22,38 +22,236 @@ Compaction 主要分为两种：
 如果在 log 恢复到 memtable 时，超过了 memtable 的大小限制，就会把 memtable 直接写成 memstable。而不会先把引用设置到 immemtable 上，再把 immemtable 写到 sstable 上。
 
 ### 运行中触发
-运行时触发分为两种情况：
-- memtable 的使用空间是否超过 4M
-- level 0 的 sstable 数量超过 4 个
+运行时触发条件如下：
+- memtable 的使用空间超过 4M（这个触发条件是在 Write 时候做的）
+- immemtable 转成 sstable 过程已经结束。（如果没有结束，会一直等到结束，然后再 check 一词遍是否结束）
 
-触发步骤发为两步，走这两步才可能触发：
-1. 在 Write 方法中，判断 memtable 的使用空间是否超过 4M。如果超过，会把 memtable 的引用设置到 immemtable 上。
-2. 调用 MaybeScheduleCompaction 方法。此方法中会判断 immemtable 是否为 null，如果不为 null 可能会执行 minor compaction。以下是调用 MaybeScheduleCompaction 方法的地方。
-  * Get
-  * Write
-  * BackgroundCall
-  * Open
+## Minor compaction 处理内容
+Minor compaction 处理主要是在 CompactMemTable 方法中进行的。主要处理内容如下：
+- 根据 immemtable 创建 sstable
+- 根据最小 key 和 最大 key，计算 sstable 应该放在哪个 level 上
+- 放入 VersionEdit 中
+- 删除 memtable 对应的 log 文件
 
-触发步骤发为两步，走这两步才可能触发：
-1. 在 Write 方法中，判断 memtable 的使用空间是否超过 4M。如果超过，会把 memtable 的引用设置到 immemtable 上。
-2. 调用 MaybeScheduleCompaction 方法。此方法中会判断 immemtable 是否为 null，如果不为 null 可能会执行 minor compaction。以下是调用 MaybeScheduleCompaction 方法的地方。
-  * Get
-  * Write
-  * BackgroundCall
-  * Open
+### 1，根据 immemtable 创建 sstable
+主要就是把 key/value 写到 sstable 上，然后再把 index_block、filter_block 等信息再写上。把`最大 key`和`最小 key`还有`文件大小`等信息写到 metaData 上，并返回给后面流程用。
 
-在上面的两个条件同时满足的情况下，会阻塞写线程，把memtable移到immtable。然后新起一个memtable，让写操作写到这个memtable里。最后将imm放到后台线程去做compaction.
+### 2，根据最小 key 和 最大 key，计算 sstable 应该放在哪个 level 上
+这块是处理中的重点，因为这些逻辑比较复杂。主要逻辑如下：
+
+- 如果 level 0 层有 key 重叠部分，就直接把 sstable 放到 level 0 层。
+- 如果 level 0 层没有 key 重叠部分，从 level 0 开始，到 level 2 做下循环判断。如果下面条件都不符合，就返回 level 2 作为要 sstable 要放的地方。
+  * 如果`level 当前 + 1`有 key 重叠部分，sstable 就放到`level 当前`里。
+  * 如果`level 当前 + 2`有 key 重叠 并且 `重叠文件大小超过指定值(20M)`，就放到`level 当前`
+
+上面的循环判断的要点是：
+> 如果条件满足，就返回`level 当前`。如果不满足，就在`level 当前+1`看看，是否可以满足，如此循环。
+ 
+下面是上面流程的过程图。引用自：[leveldb之Compaction (1) --从MemTable到SSTable文件](http://bean-li.github.io/leveldb-compaction/)
+![PickLevelForMemTableOutput](media/PickLevelForMemTableOutput.png)
+
+#### 复杂的原因
+为什么比较复杂呢？下面是关于 kMaxMemCompactLevel 常量上的一段注释：
+```
+// Maximum level to which a new compacted memtable is pushed if it
+// does not create overlap.  We try to push to level 2 to avoid the
+// relatively expensive level 0=>1 compactions and to avoid some
+// expensive manifest file operations.  We do not push all the way to
+// the largest level since that can generate a lot of wasted disk
+// space if the same key space is being repeatedly overwritten.
+static const int kMaxMemCompactLevel = 2;
+```
+
+个人总结原因如下：
+**为什么`level 较小的`有 key 重叠就放到`level 较小的`的上面呢？（例如，如果 level 0 上有重叠，就放到 level 0 上）**
+因为既然有重叠，不放到同一层的话，查找到的值就有可能是`重叠的旧值`。因为查找是从`较小的 level`开始，如果在 level 0 上有 key 了，新的 key 却放到 level 1 上的话，那在 level 0 上查找到`旧 key`后就直接返回了。
 
 
-todo 在 level0 sstable num > 4 时，也进行 minor.
+**为什么 level 0,1,2 都没有重叠，要放到 level 2 呢？**
+level 越小，也就是说`文件数越少`/`compaction 容量越小`，compaction 机率越大。上面说了，把 sstable 放到 level 2，可以避免`相对比较昂贵的leve 0 -> 1 的 compaction`和`昂贵的 mainfest 操作`。
+
+
+**为什么不放到`最大的 level`呢？**
+不放到最大 level 的原因是，避免空间浪费。因为 key 和 value 是可以重叠的，如果放在最大 level，很久不进行 compaction 的话，重叠的 key 和 value 会一直存在，不会被回收。
+
+**当 level 0 上没有重叠，level 1 上有重叠，为什么要放在 level 0 上呢？**
+可能是因为查询能够更快。不用访问 leve 1 层。
+
+**当 level 0,1 上没有重叠，为什么要判断 level 2 上重叠的数据是否过大呢？**
+todo 还不太明白，可能和 major compaction 有关。
+
 
 # Major compaction
-MaybeScheduleCompaction 中的`versions_->NeedsCompaction`条件应该只是为 Major compaction 准备的，因为 minor compaction 条件中，immemtable 必须不为空。
+Major compaction 的主要作用是把 level 0~6 层的 sstable 进行合并操作。如果不合并的话，文件个数多，并且重叠的 key/value 也很多，影响查询速度和使文件过于庞大。
+
+## Major compaction 触发条件
+- level 0 文件总个数（4个）
+- level 1~6 文件总大小超过阈值
+- 文件 Seek（查找）次数超过阈值（文件长度／16KB）
+
+下面说说每个条件。
+
+### 触发条件1: level 0 文件总个数（4个）
+为什么 level 0 的触发条件是文件个数，而其它 level 而是以总文件大小呢？
+在 VersionSet::Finalize 方法里，有一段注释，说明了原因。在自己理解的基础上，翻译了一下。
+原文：
 ```
-  } else if (imm_ == nullptr &&
-             manual_compaction_ == nullptr &&
-             !versions_->NeedsCompaction()) {
+// We treat level-0 specially by bounding the number of files
+// instead of number of bytes for two reasons:
+//
+// (1) With larger write-buffer sizes, it is nice not to do too
+// many level-0 compactions.
+//
+// (2) The files in level-0 are merged on every read and
+// therefore we wish to avoid too many files when the individual
+// file size is small (perhaps because of a small write-buffer
+// setting, or very high compression ratios, or lots of
+// overwrites/deletions).
 ```
+自己理解：
+- 如果使用`文件个数`的方式的话，write-buffer(memtable 的 buffer) 大小越大，compaction 次数就越少。
+- 因为 level 0 上的 sstable 是可以发生重叠的，所以 read 操作需要遍历每个 sstable。所以为了保证读取速度，避免因为文件大小设置过小，造成文件过多。例如：如果不是以文件个数，而以总文件大小作为处发条件的话，在总文件大小不变的情况下，把 sstable 文件大小改的越小，文件就越多，read 操作就越慢。如果以文件个数的话，sstable 数量就不会过多（但也会产生 compaction 过多的问题，所以 sstable 不能太小）。
+
+> memtable 的大小到了 4M 就会写成 sstable，这样看 level 0 的 sstable 大小应该是 4M。但 options 里的 max_file_size 定义是 2M，而且在 memtable 写成 sstable 时也没有大小限制。
+
+todo 这里应该和 level 0 或 memtable 写 sstable 有关，这两个好像越多，write 就越慢，所以有两个在做时，write 操作要暂停 1ms 等。
+
+### 触发条件2：level 1~6 文件总大小超过阈值
+level 1~6 的文件总大小是不是超过阈值，是通过 VersionSet::Finalize 进行计算的（level 0 的文件个数也是在这里计算的）。在这个方法中，调用了一个 MaxBytesForLevel 方法，此方法中给出了每个 level 文件总大小的阈值。
+
+level | 阈值
+--- | ---
+1 |      10M 
+2 |     100M
+3 |    1000M
+4 |   10000M
+5 |  100000M
+6 | 1000000M
+
+> todo 如果每个 sstable 大小为 2M，那 level 最多有 5 个 sstable？
+
+### 触发条件3：文件 Seek（查找）次数超过阈值（文件长度／16KB）
+为什么会因为 seek 不到数据次数过多，而进行 compaction 呢？下面的注释中进行了解释。
+```
+// We arrange to automatically compact this file after
+// a certain number of seeks.  Let's assume:
+//   (1) One seek costs 10ms
+//   (2) Writing or reading 1MB costs 10ms (100MB/s)
+//   (3) A compaction of 1MB does 25MB of IO:
+//         1MB read from this level
+//         10-12MB read from next level (boundaries may be misaligned)
+//         10-12MB written to next level
+// This implies that 25 seeks cost the same as the compaction
+// of 1MB of data.  I.e., one seek costs approximately the
+// same as the compaction of 40KB of data.  We are a little
+// conservative and allow approximately one seek for every 16KB
+// of data before triggering a compaction.
+f->allowed_seeks = (f->file_size / 16384);
+if (f->allowed_seeks < 100) f->allowed_seeks = 100;
+```
+
+大概意思是说，如果一个 sstable seek 不到 N 次的话，那么这 N 所花费的时间 和 把这个 sstable 进行 compaction 所花费的时间差不多。为了不在这个 sstable 上继续浪费时间，就把它 compaction，这样就会减少文件打开。
+
+什么场景下会产生这种查很多次查不到呢？可能会有两个场景：
+- 热点数据：如果在一个 sstable 上进行查找的话，`要找的 key`肯定在此 sstable 的`最大 key`和`最小 key`之间。但经过查找还找不到数据，说明此 sstable 可能不包含`热点数据`(就是经常被使用的数据)。如果不包含热点数据，还经常读它的话，浪费文件打开时间和缓存等资源。
+- key 范围重叠。文章（[leveldb之Compaction (2)--何时需要Compaction](http://bean-li.github.io/leveldb-compaction-2/)）上说是原因是有严重的重叠。确实重叠才产生这种问题的一个原因。例如：level 1 sstable 的 key 小范围是 30~100，level 2 sstable 范围是 40~110，但 level 1 上只有 30 和 100 两个 key，而 level 2 上有 很多 key，这时候是范围重叠原因。但如果 level 1 有很多 key，而 level 2 上 key 很少，还发生了 level 1 上 seek miss，这时候可能是热点数据的原因。
+
+> seek 是怎么一个过程呢？seek 过程就是一个 sstable 的查找过程，先使用 filter_block 查找，有可能还对具体的 data_block 进行查找。
+
+### 触发条件的设置和判断代码
+触发条件 1 和 2 是在`VersionSet::Finalize`方法中设置的。触发条件 3 是在 `Version::UpdateStats`方法中进行设置的。
+
+判断代码在`VersionSet::PickCompaction`方法中。而`PickCompaction`方法是在`MaybeScheduleCompaction`中一层层调用到的。
+
+
+# Compaction 
+## 关于 level 中的 sstable
+剔除level 0不论，对于任何一个层级来说，层级的内的任意一个文件本身是有序的，而位于同一层级的内部的多个文件，他们也是有序的，而且key是不交叉的。但是很不幸的是，level n 和level n＋1的文件，key的范围可能交叉，这种交叉，就可能带来 seek miss，即数据有可能位于level n的某个文件中（根据该文件的最小key和最大key和用户要查找的key来推算），但是实际情况是并不在level n的该文件中，不得不去level n＋1的文件查找。这种seek miss不解决，就会造成查询效率的下降。而且每个 level 中的数据会有重叠的情况，即 key user 在 level n+1 里有，在 level n 里也有。
+
+如何解决？
+
+出现这种 seek miss 的原因是level n和level n ＋ 1，在某些key的范围内，是有交叉的。解决的方法即：根据 level n 的某个(些)文件，找到 level n＋1 中 key 范围有交叉的文件，然后合并 level n 和 level n+1 找出的文件，归入level n＋1，而删除 level n 的该部分文件，从而消除该key范围内，level n 和 level n+1 的重叠。而且进行 key 范围有交叉的文件进行合并，也可以消除 key 重叠的问题。
+
+todo 那为什么LevelDB非要搞出来level 0 ～level 6 这么多的层级呢？就level 0和level 1不好吗？
+
+
+## 如何选取哪此文件进行 Compaction
+Compaction 的过程就是`选取 level n 和 level n+1 的 sstable`，然后进行合并。但 Compaction 根据触发条件不一样，在 level n 进行 Compaction 的文件也不一样。下面细说一下，主要分成以下部分进行说明：
+- level n 层文件选取
+- level n+1 层文件选取
+- 进行合并
+
+### level n 层文件选取
+上面说了，在进行 level n 层文件选取时，根据触发条件不一样，选取的文件也不一样。
+
+#### seek 触发
+seek miss 触发时，选取比较简单。就选取达到 seek miss 阈值的那个文件，做为 level n 层进行 compaction 的文件。
+
+#### 文件大小或个数触发
+文件大小或个数触发的情况，要经过两个步骤选取文件：
+- 需要考虑上一次`该 level 的 compaction`做到了哪个 key，然后`大于该key`的第一个文件即为 compaction 文件。如果第一次做，或者上次已经是最大的 key，那么回到第一个文件开始 compaction。
+- 对于n >0的情况，初选情况下（即调用SetOtherInput之前）level n的参战文件只会有1个，如果n＝0，因为level 0的文件之间，key可能交叉重叠，因此，根据选定的level 0的该文件，得到该文件负责的最小key和最大key，找到所有和这个key 区间有交叠的level 0文件，都加入到参战文件。
+
+简单概括，即当n>0的时候，初选 level n的参战文件只会有1个，而n ＝ 0的时候，初选的情看下，level n的文件也可能有多个。
+
+### level n+1 层文件选取
+确定了 level n 的文件，根据 level n 文件，就可以确定出 level n 文件的`最小 key`和`最大key`，有了`最小 key`和`最大 key`，就可以进一步确定 level n＋1 需要的文件。
+
+选择level n＋1的步骤如下：
+1. 根据level n的文件，计算得到`最小 key`和`最大 key`
+2. 根据`最小 key`和`最大 key`圈定的 key 的范围，从level n＋1中选择和该范围有交叠的所有文件，计入c->inputs_[1]，作为 level n＋1 的文件
+3. 根据第一步和第二步的到的所有的 level n 的文件和 level n＋1 的文件，计算`选取的` level n 和 level n+1 文件中`最小 key`和`最大 key`
+4. 根据`选取的` level n 和 level n+1 文件中`最小 key`和`最大 key`，来看看 level n 中是否还有文件可加入 compaction。如果有就加入 level n 选取的文件中。
+
+1 和 2 好理解，3 和 4 又是为了做什么呢？为什么还在重新看一下 level n 中有没有进行可以 compaction 的文件呢？我们看一下下面的说明：
+
+看下图，根据 1 和 2 的处理，level n 中的文件 A 计算出了 level n＋1 中的 B C D 需要一起 compaction。但是由于B C D的加入，key的范围扩大了，又一个问题是 level n 层的 E 需不需要一起 compaction？从上图看，还是一起比较好的，因为 A＋E 确定的范围，完全笼罩在计算出来的B C D的范围之内，不会因为E的加入，而扩大level n＋1的文件。
+![calc_level_n_1](media/calc_level_n_1.png)
+
+
+我们再举一个例子，根据下图所示的情况，很明显E是不能加入战局的原因是 leven n＋1 层的B C D无法笼罩 A＋E 确定的范围，如果不管不顾，（A＋E）和（B＋C＋D） 一起Compaction造成的恶果就是，很可能和level n＋1 的某个已有文件(F)发生重叠，这就破坏了 level 1～level 6 同一层的文件之间不许重叠的约定（合并后的文件和 F 发生 key 小范围重叠）。因此，下图的情况，是不允许 level n 的 E 参与的。
+![level_n_1_not](media/level_n_1_not.png)
+
+说笼罩，其实也不确切了，因为 level n 新加入了文件，很大key 可能造成key的范围扩大，只要扩大后的key的范围，不会 involve 新的 level n＋1 的文件就行。如下图所示，虽然已经超出了 level n+1 文件圈定的范围，但是并没有和 level n＋1 其他的文件重叠交叉，这样也是可以的。
+![level_n_ok](media/level_n_ok.png)
+
+如果满足上述条件是不是 level n的文件 E 是不是一定可以 compaction 呢？ 也不一定，看参战文件是否已经超出了上限。注意，单次 compaction 的文件，我们不希望太多，造成瞬时的读写压力。因此，到底扩不扩容，看扩容之后参战文件的总大小。如果加入了level n的扩容文件，leven n和level n＋1的文件总长度超过了上限，那么就放弃扩容 level n中的文件。
+
+上限是多少？25倍的TargetFileSize，以典型的2M大小为例，如果level n和level n＋1的总大小超过了50MB，就不再主动扩容，将level n的某些符合条件的文件involve 进来了。
+
+最后的最后是记录下本次 compaction 文件的最大 key，对于size compaction, 下一次要靠该值来选择 level n 的文件。
+
+
+## Compaction 具体执行过程
+todo 这部分内容还不少，等以后再介绍。
+
+
+# 细节
+## 1，当 level 0 文件数过多时
+level 0 的 Major compaction 条件是文件数超过 4 个。但因为 write 操作量非常大，造成 level 0 文件超过 4 个的情况也是有的。当遇到这种情况，levelDB 是这么处理的：
+- 在 write 操作时，如果发现 level 0 文件数超过 8 个，每次写操作前都会 sleep 1ms。这么做是为了能把一部分 CPU 给 compaction 操作。
+- 在 write 操作时，如果发现 level 0 文件数超过 12 个，暂停 write 操作，等待 compaction 完成（minor 或 major）。
+
+**为什么对 level 0 的文件数进行确认呢？**
+因为如果 level 0 上文件越多的话，read 越慢。因为 level 0 上的 sstable 里的 key 是有可能重叠的，所以在查找时需要一个个 sstable 查找。其它 level 的 sstable 都是不重叠的，所以在查找 key 时，可以使用二分法查找哪个 sstable 上，不用一个个查找。
+
+
+## 2，Compaction 的优先级
+在 compaction 有 minor 和 major 两种，而 major 里触发条件还有`文件大小`或`Seek miss`等。他们之间也是有优先级关系的，优先级关系如下：
+> Minor > Manual > Size > Seek
+
+- minor 是优先级最高的。例如，在 BackgroundCompaction 方法，会有如果 immemtable 不为空，就进行 minor compaction 的判断。在 major compaction 进行中(DoCompactionWork方法中)时，还有类似的判断。
+- Manual 种类的 compaction 没有在文章中介绍。
+- Size 和 Seek 优先级，在 VersionSet::PickCompaction 方法中可以看到。
+
+为什么要把 minor 最优先呢？因为如果 immemtable 不可用的话，是无法进行 write 操作的。所以需要尽快把 immemtable 写成 sstable。
+
+## 3，每个 level 的 sstable 大小
+- level 0：4M
+- leve 1~6：2M
+
+level 0 的 sstable 是根据 memtable 大小限制生成的。
+level 1~6 是在 compaction 时，看是否超过指定大小来生成的。
 
 # 源码解读
 ## 1，Minor Compaction 的触发条件
@@ -61,7 +259,7 @@ MaybeScheduleCompaction 中的`versions_->NeedsCompaction`条件应该只是为 
 - memtable 的使用空间是否超过 4M
 - level 0 的 sstable 数量超过 4 个
 
-第一个条件是在 MakeRoomForWrite 方法中的以下 if 条件中判断的，条件的意思是：如果 memtable 大小没有超过 4M，就返回（不做压缩）。
+第一个条件是在 MakeRoomForWrite 方法中的以下 if 条件中判断的，条件的意思是：如果 memtable 大小没有超过 4M，就返回（不做压缩）。（这个方法只会在 Write 方法中被调用）
 ```
 } else if (!force &&
            (mem_->ApproximateMemoryUsage() <= options_.write_buffer_size)) {
@@ -85,13 +283,19 @@ MaybeScheduleCompaction 中的`versions_->NeedsCompaction`条件应该只是为 
 - 如果 level 0 层的话，score = level 0 层 sstable 文件个数 / 4
 - 如果 level 1~6 层的话，score = level i 层 sstable 文件总大小 / i 层 compaction 阈值大小
 
-
+MaybeScheduleCompaction 方法会被下面的方法调用
+- Get
+- Write
+- BackgroundCall
+- Open
 
 
 # 问题
-1，为什么？如果查找了多次，某个文件不得不查找，却总也找不到，总是去高一级的level，才能找到。这说明该层级的文件和上一级的文件，key的范围重叠的很严重？
+OK 1，为什么？如果查找了多次，某个文件不得不查找，却总也找不到，总是去高一级的level，才能找到。这说明该层级的文件和上一级的文件，key的范围重叠的很严重？
+上面已经说明了
 
-2，level 一共几层？
+OK 2，level 一共几层？
+7
 
 3，说一下下面参数的作用。
 static const int kNumLevels = 7;
@@ -117,16 +321,71 @@ static const int kMaxMemCompactLevel = 2;
 static const int kReadBytesPeriod = 1048576;
 
 
-===================
-下面这段的意义
-      // We are getting close to hitting a hard limit on the number of
-      // L0 files.  Rather than delaying a single write by several
-      // seconds when we hit the hard limit, start delaying each
-      // individual write by 1ms to reduce latency variance.  Also,
-      // this delay hands over some CPU to the compaction thread in
-      // case it is sharing the same core as the writer.
-      mutex_.Unlock();
-
 4，看一下 doc/impl.html 中的说明。
 
-5，看一下 void VersionSet::Finalize(Version* v) 里的那段英文说明。
+OK 5，看一下 void VersionSet::Finalize(Version* v) 里的那段英文说明。
+
+OK 6，总结当L0的文件数量要达到阈值的时候，我们每次写入都延迟1ms，
+```
+// 当L0的文件数量要达到阈值的时候，我们每次写入都延迟1ms，
+// 这样可以为后台的compaction腾出一定的cpu（当后台compaction
+//和当前线程是使用的一个内核的时候）这样可以降低写入延迟的方差
+//因为延迟被分摊到多个写上面，而不是在几个甚至一个写的时候
+env_->SleepForMicroseconds(1000);
+allow_delay = false; // 每次写只允许延迟一次
+```
+
+OK 7，C++ 代码中，有没有下面的功能。
+值得注意的是，minor compaction是一个时效性要求非常高的过程，要求其在尽可能短的时间内完成，否则就会堵塞正常的写入操作，因此minor compaction的优先级高于major compaction。当进行minor compaction的时候有major compaction正在进行，则会首先暂停major compaction。
+
+8，CompactMemTable 中，保存成 sstable 和 删除 log 的操作，如何做成同步操作。就是不会在创建完 sstable 后，因为停电，造成 log 没有补删除。
+
+
+OK 9，说一下 level 0 为什么以文件个数进行计算的原因。
+先说level 0 为什么搞特殊。
+
+注释说的很明白，level 0的文件之间，key可能是交叉重叠的，因此不希望level 0的文件数特别多。我们考虑write buffer 比较小的时候，如果使用size来限制，那么level 0的文件数可能太多。
+
+另一个方面，如果write buffer过大，使用固定大小的size 来限制level 0的话，可能算出来的level 0的文件数又太少，触发 level 0 compaction的情况发生的又太频繁。因此level 0 走了一个特殊。
+
+OK 10，每个 level 的 sstable 的大小是多少？
+
+OK 11，todo 除了 level 0 外，其它 level 上同层有 key 重叠吗？上下 level 之间应该是有 key 重叠吧？
+
+OK 12，总结一下每种触发的优先级。
+
+OK 13，记录，在每次 majro compaction 执行过程中，都会判断是否需要 minor compaction。如果需要，就先进行 minor compaction，暂停正在进行的 major compaction。
+
+
+# 参考：
+- [leveldb之Compaction (1) --从MemTable到SSTable文件](http://bean-li.github.io/leveldb-compaction/)：本文绝大部分的内容都是参考这里，讲的非常好。这个部分的文章是连续的，还有下面的 2 篇。
+- [leveldb之Compaction (2)--何时需要Compaction](http://bean-li.github.io/leveldb-compaction-2/)
+- [leveldb之Compaction（3）－－选择参战文件](http://bean-li.github.io/leveldb-compaction-3/)
+- [leveldb源码分析--SSTable之Compaction - tgates - 博客园](https://www.cnblogs.com/KevinT/p/3819134.html)：关于源码的解读。因为每篇文章都是针对某一部分讲的很好，所以每篇文章都有一些可看之处。
+- [leveldb源码剖析----compaction - Swartz2015的专栏 - CSDN博客](https://blog.csdn.net/Swartz2015/article/details/67633724)：此文章有关于具体的 compaciton 执行过程的源码讲解。
+
+
+# todo
+1，下面是运行场景总结，但感觉乱，应该不会是这样。可能应该是 minor 只会在 使用空间超过 4M 时才会运行。其它的条件可能都是为了 major 
+
+
+运行时触发条件如下：
+- memtable 的使用空间超过 4M，并且 immemtable 已经被保存成 sstable 文件（即 immemtable == null）
+- MaybeScheduleCompaction 方法被调用。以下是调用 MaybeScheduleCompaction 方法的地方。
+  * Get
+  * Write
+  * BackgroundCall
+  * Open
+
+触发场景 1：
+在 Write 方法中，满足`触发条件 1`即可触发。
+
+触发场景 2：
+在 Write 方法中，满足`触发条件 1`，但没有调用 minor compaction 函数之前，调用了以下方法，先调用了 MaybeScheduleCompaction 函数。
+- Get
+- Write
+- BackgroundCall
+- Open
+
+> 感觉这个结构有点混乱，但根据源码总结出来的。很多文章对这块讲的都不太一样，不知道哪个对。
+

@@ -426,4 +426,16 @@ executor | cores | partition | 读取方式
   - [Spark streaming 设计与实现剖析](https://mp.weixin.qq.com/s?__biz=MzI3MjY2MTYzMA==&mid=2247483758&idx=1&sn=acd78535a2398f7109087256f3a06b15&scene=21#wechat_redirect)
 
 
+## 28，如何删除 spark application history
+CDH 修改 spark-defaults.conf 文件，添加以下配置：
+```
+spark.history.fs.cleaner.enabled true
+spark.history.fs.cleaner.maxAge  12h
+spark.history.fs.cleaner.interval 1h
+```
 
+但删除的比较慢。
+
+参考：
+- [Spark History Server Automatic Cleanup – Hadoopsters](https://hadoopsters.net/2016/10/27/spark-history-server-automatic-cleanup/)
+- [Cleaning up Spark history logs - Stack Overflow](https://stackoverflow.com/questions/42817924/cleaning-up-spark-history-logs)
