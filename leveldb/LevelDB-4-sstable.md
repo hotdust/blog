@@ -447,6 +447,9 @@ data_block 都以类似 skiplist 的结构存储的，所以读取时也可以�
 - cache：把索引和一部分 data_block 保存在内存中，方便快速读取。
 - 数据以 key 顺序存储：在 compaction 时，能快速进行归并排序。
 
+## 9，sstable 文件后缀
+最开始是 sst，在 2013 年左右变成了 ldb。
+
 # 问题
 ## 1，当在 sstable 进行查找时，是如何使用 restart point 的呢？
 OK

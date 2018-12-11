@@ -2,7 +2,7 @@
 ## 为什么需要日志（WAL or journal）
 - 日志是`单机本地存储系统`的不可缺少的。
 - `单机本地存储系统`就是日志的具体实现（standalone local storage system is substantialization of WAL）。
-- 日志保证数据完整性，在断电或线程崩溃等情况发生时。
+- 在断电或线程崩溃等情况发生时，日志保证数据完整性。
 - 日志是处理`事务的ACID`的关键。
 - 顺序访问比随机访问快得多。
 
@@ -29,7 +29,7 @@
 在本文中主要分析日志的结构、写入读取操作。
 
 # 日志文件
-日志文件有两个：一个是对应 memtable，一个是对应 immutable memtable。
+日志文件有两个：一个是对应 memtable，一个是对应 immutable memtable（后面简称 immemtable）。
 ![leveldb_ls](media/leveldb_lsm.png)
 ![leveldb_localfs](media/leveldb_localfs.png)
 从上图可以看出，`000062.log`和`000064.log`对应两个 memtable。
@@ -50,7 +50,7 @@
 
 ![journa](media/journal.jpg)
 
-为了增加读取效率，日志文件中按照block进行划分，每个block的大小为32KB。每个block中包含了若干个完整的record。
+为了增加读取效率，日志文件中按照block进行划分，每个block的大小为32KB。每个block中包含了若干个完整的record（上图中每行都是一个 block）。
 
 一条日志记录包含一个或多个record。每个record包含了一个7字节大小的header，前4字节是该record的校验码，紧接的2字节是该record数据的长度，以及最后一个字节是该record的类型。其中checksum校验的范围包括record的类型以及随后的data数据。
 
@@ -71,12 +71,13 @@ record共有四种类型：full，first，middle，last。一条日志记录若�
 - Data（就是上面的图中的 payload）
 
 其中 header 中有：
-1. 当前 db 的 sequence number
-2. 本次日志记录中所包含的 put/del 操作的个数。
+1. sequence number：数据在写入时，分配的 sequence number
+2. entry number：本次日志记录中所包含的 put/del 操作的个数。
 
-紧接着写入所有 batch 编码后的内容。有关 batch 的编码规则，可以见 读写操作.
+紧接着写入所有 batch 编码后的内容。
 
-> 在向 memtable 里写数据时，把 key 进行了扩展，变成 internal_key。但在写日志时，没有对接收到的数据进行任何扩展，原样的（head(sequence + count) + OP_N）放到了 Record 里。
+> 注意：在向 memtable 里写数据时，把 key 进行了扩展，变成 internal_key。但在写日志时，没有对接收到的数据进行任何扩展，原样的（head(sequence + count) + OP_N）放到了 Record 里。
+> 关于原因，个人感觉是因为`日志`中的内容只是需要按顺序读取，不需要在文件中进行随机查找。
 
 # 日志写
 ![journal_write](media/journal_write.jpg)
@@ -101,7 +102,7 @@ singleWriter开始写入时，标志着第一个record开始写入。在写入�
 
 
 # 个人总结
-## 1，关于 memtable 和 immutable memtable
+## 1，关于 memtable 和 immemtable
 两个 memtable 这种模式，主要是为了能够不阻塞写操作。这种模式在 RocketMQ 中也有体现，在 CommitLog 接收消息写入处理时，接收到一定时间的消息后，就要处理这些消息。处理消息之前，准备另一个 queue 来接收`新的消息`。这样在处理`已经接收到的消息`时，不影响新的消息的接收。
 
 ## 2，写操作的原子性
@@ -120,7 +121,7 @@ RocketMQ 当写不下全部数据的时候，不会分成 first、middle、last�
 ## 4，日志文件的保存和删除
 在保存文件到磁盘时，是以每个 block 为单位保存的。如果不把 block 填满，就不会保存到磁盘上。从 block 的数据结构就可以看出，block 的第一个字段是保存`数据部分 CRC 校验值`。（这么做的话，可能存储在数据丢失的风险）
 
-immutable memtable 则会由后台的minor compaction进程将其转换成一个sstable文件进行持久化，持久化完成，与之对应的日志被删除。
+immemtable 则会由后台的minor compaction进程将其转换成一个sstable文件进行持久化，持久化完成，与之对应的日志被删除。
 
 ## 5，为什么使用 skiplist 做为数据结构，可不可以使用 Btree 等树做为
 BTree 有很多变形，例如：B+Tree、B*Tree。只要像下面这样保存到文件中。
@@ -137,3 +138,10 @@ BTree 有很多变形，例如：B+Tree、B*Tree。只要像下面这样保存�
 - [Leveldb_RTFSC](http://www.grakra.com/2017/06/17/Leveldb-RTFSC/)
 - [LevelDB：写操作](https://www.jianshu.com/p/8639b21cb802)
  
+ 
+ 
+ 
+todo
+ 
+1， 一个日志文件多大
+2，文章最下面那段，应该是 Go 的实现，看看 C++ 实现吗？

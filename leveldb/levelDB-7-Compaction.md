@@ -1,6 +1,8 @@
 # 前言
-其本质是一种内部数据重合整合的机制，同样也是一种平衡读写速率的有效手段。
-Immutable MemTable -> immtable
+为什么需要 Compaction，原因有两个：
+- 提高查询速度：打开的文件越多，查询的速度越慢。而且，level 0 层查找时，是每个文件都需要查找，所以通过减少文件来加快 level 0 层的查询速度。
+- 删除重叠数据：Insert A 和 Delete A 是两条数据，并且可能不在同一个文件中。通过 Compaction 把他们变成 1 条数据，减少磁盘空间。
+
 
 # Compaction 分类
 Compaction 主要分为两种：
@@ -164,7 +166,7 @@ if (f->allowed_seeks < 100) f->allowed_seeks = 100;
 判断代码在`VersionSet::PickCompaction`方法中。而`PickCompaction`方法是在`MaybeScheduleCompaction`中一层层调用到的。
 
 
-# Compaction 
+# Compaction 过程
 ## 关于 level 中的 sstable
 剔除level 0不论，对于任何一个层级来说，层级的内的任意一个文件本身是有序的，而位于同一层级的内部的多个文件，他们也是有序的，而且key是不交叉的。但是很不幸的是，level n 和level n＋1的文件，key的范围可能交叉，这种交叉，就可能带来 seek miss，即数据有可能位于level n的某个文件中（根据该文件的最小key和最大key和用户要查找的key来推算），但是实际情况是并不在level n的该文件中，不得不去level n＋1的文件查找。这种seek miss不解决，就会造成查询效率的下降。而且每个 level 中的数据会有重叠的情况，即 key user 在 level n+1 里有，在 level n 里也有。
 
@@ -225,6 +227,10 @@ seek miss 触发时，选取比较简单。就选取达到 seek miss 阈值的�
 ## Compaction 具体执行过程
 todo 这部分内容还不少，等以后再介绍。
 
+todo 在合并 sstable 时，哪些 key 可以删除掉是有条件的，并不是有 Deletion 标志的 Key 都可以删除掉。
+- 对于一个 Deletion 状态的 Key 来说，如果当前 key 所在 level 的上层 level 中，没有 key 范围重叠的 sstable 的话，才会删除这个 key。如果有重叠，并且删除掉的话，原来已经是删除状态的 key，可能又复活了，又可以查到 value 了。
+
+
 
 # 细节
 ## 1，当 level 0 文件数过多时
@@ -253,7 +259,41 @@ level 0 的 Major compaction 条件是文件数超过 4 个。但因为 write �
 level 0 的 sstable 是根据 memtable 大小限制生成的。
 level 1~6 是在 compaction 时，看是否超过指定大小来生成的。
 
-# 源码解读
+## 4，还什么时候会启动 compaction
+以下的 db_impl.cc 里的操作都会启动 compaction。但应该只有 Write 会启动 minor compaction。
+
+Operation | file-number | explanation
+---|---|---
+Get | db/db_impl.cc-1147 | after read an Key-Value pair
+Write | db/db_impl.cc-1374 | after created a new MemTable
+RecordReadSample | db/db_impl.cc-1170 | after walked througth several KeyValue pairs
+BackgroundCall | db/db_impl.cc-681 | after the background thread has complete the previous compaction task.
+Open | db/db_impl.cc-1521 | when open and recover LevelDB.
+
+
+
+
+# 参考：
+- [leveldb之Compaction (1) --从MemTable到SSTable文件](http://bean-li.github.io/leveldb-compaction/)：本文绝大部分的内容都是参考这里，讲的非常好。这个部分的文章是连续的，还有下面的 2 篇。
+- [leveldb之Compaction (2)--何时需要Compaction](http://bean-li.github.io/leveldb-compaction-2/)
+- [leveldb之Compaction（3）－－选择参战文件](http://bean-li.github.io/leveldb-compaction-3/)
+- [leveldb源码分析--SSTable之Compaction - tgates - 博客园](https://www.cnblogs.com/KevinT/p/3819134.html)：关于源码的解读。因为每篇文章都是针对某一部分讲的很好，所以每篇文章都有一些可看之处。
+- [leveldb源码剖析----compaction - Swartz2015的专栏 - CSDN博客](https://blog.csdn.net/Swartz2015/article/details/67633724)：此文章有关于具体的 compaciton 执行过程的源码讲解。
+- [leveldb之Compaction操作下之具体实现 - qinm的专栏 - CSDN博客](https://blog.csdn.net/u012658346/article/details/45788939)：讲了一部分 version 操作，需要时候可以看看。
+- [LevelDB-Compaction](http://openinx.github.io/2014/08/17/leveldb-compaction/)：讲了一些 compaction 的想法。还整理了一些 compaction 时的条件和约束，挺清晰的。
+- [SSTable之Compaction上篇-leveldb源码剖析(9) | PandaDemo](http://www.pandademo.com/2016/04/compaction-of-sstable-leveldb-part-1-source-dissect-9/)：根据对代码的讲解。如果不知道某一块代码意思时，可以去看看。还讲到了 version 操作。
+- [Leveldb_RTFSC | GRAKRA 三十年众生牛马 六十年诸佛龙象](http://www.grakra.com/2017/06/17/Leveldb-RTFSC/)：国人用英文写的，里面有 major compaction 之前和之后的例子。
+
+
+
+# Todo
+## 1，看一下具体的 compaction 操作，里面有许多和 version 相关的操作。
+
+
+## 2，CompactMemTable 中，保存成 sstable 和 删除 log 的操作，如何做成同步操作。就是不会在创建完 sstable 后，因为停电，造成 log 没有补删除。
+
+
+# 源码理解记录
 ## 1，Minor Compaction 的触发条件
 ### 运行时触发
 - memtable 的使用空间是否超过 4M
@@ -290,102 +330,12 @@ MaybeScheduleCompaction 方法会被下面的方法调用
 - Open
 
 
-# 问题
-OK 1，为什么？如果查找了多次，某个文件不得不查找，却总也找不到，总是去高一级的level，才能找到。这说明该层级的文件和上一级的文件，key的范围重叠的很严重？
-上面已经说明了
-
-OK 2，level 一共几层？
-7
-
-3，说一下下面参数的作用。
-static const int kNumLevels = 7;
-
-// Level-0 compaction is started when we hit this many files.
-static const int kL0_CompactionTrigger = 4;
-
-// Soft limit on number of level-0 files.  We slow down writes at this point.
-static const int kL0_SlowdownWritesTrigger = 8;
-
-// Maximum number of level-0 files.  We stop writes at this point.
-static const int kL0_StopWritesTrigger = 12;
-
-// Maximum level to which a new compacted memtable is pushed if it
-// does not create overlap.  We try to push to level 2 to avoid the
-// relatively expensive level 0=>1 compactions and to avoid some
-// expensive manifest file operations.  We do not push all the way to
-// the largest level since that can generate a lot of wasted disk
-// space if the same key space is being repeatedly overwritten.
-static const int kMaxMemCompactLevel = 2;
-
-// Approximate gap in bytes between samples of data read during iteration.
-static const int kReadBytesPeriod = 1048576;
-
-
-4，看一下 doc/impl.html 中的说明。
-
-OK 5，看一下 void VersionSet::Finalize(Version* v) 里的那段英文说明。
-
-OK 6，总结当L0的文件数量要达到阈值的时候，我们每次写入都延迟1ms，
+## 关于 NeedsCompaction
+14，MaybeScheduleCompaction 中的`versions_->NeedsCompaction`条件应该只是为 Major compaction 准备的，因为 minor compaction 条件中，immemtable 必须不为空。
 ```
-// 当L0的文件数量要达到阈值的时候，我们每次写入都延迟1ms，
-// 这样可以为后台的compaction腾出一定的cpu（当后台compaction
-//和当前线程是使用的一个内核的时候）这样可以降低写入延迟的方差
-//因为延迟被分摊到多个写上面，而不是在几个甚至一个写的时候
-env_->SleepForMicroseconds(1000);
-allow_delay = false; // 每次写只允许延迟一次
+  } else if (imm_ == nullptr &&
+             manual_compaction_ == nullptr &&
+             !versions_->NeedsCompaction()) {
 ```
 
-OK 7，C++ 代码中，有没有下面的功能。
-值得注意的是，minor compaction是一个时效性要求非常高的过程，要求其在尽可能短的时间内完成，否则就会堵塞正常的写入操作，因此minor compaction的优先级高于major compaction。当进行minor compaction的时候有major compaction正在进行，则会首先暂停major compaction。
-
-8，CompactMemTable 中，保存成 sstable 和 删除 log 的操作，如何做成同步操作。就是不会在创建完 sstable 后，因为停电，造成 log 没有补删除。
-
-
-OK 9，说一下 level 0 为什么以文件个数进行计算的原因。
-先说level 0 为什么搞特殊。
-
-注释说的很明白，level 0的文件之间，key可能是交叉重叠的，因此不希望level 0的文件数特别多。我们考虑write buffer 比较小的时候，如果使用size来限制，那么level 0的文件数可能太多。
-
-另一个方面，如果write buffer过大，使用固定大小的size 来限制level 0的话，可能算出来的level 0的文件数又太少，触发 level 0 compaction的情况发生的又太频繁。因此level 0 走了一个特殊。
-
-OK 10，每个 level 的 sstable 的大小是多少？
-
-OK 11，todo 除了 level 0 外，其它 level 上同层有 key 重叠吗？上下 level 之间应该是有 key 重叠吧？
-
-OK 12，总结一下每种触发的优先级。
-
-OK 13，记录，在每次 majro compaction 执行过程中，都会判断是否需要 minor compaction。如果需要，就先进行 minor compaction，暂停正在进行的 major compaction。
-
-
-# 参考：
-- [leveldb之Compaction (1) --从MemTable到SSTable文件](http://bean-li.github.io/leveldb-compaction/)：本文绝大部分的内容都是参考这里，讲的非常好。这个部分的文章是连续的，还有下面的 2 篇。
-- [leveldb之Compaction (2)--何时需要Compaction](http://bean-li.github.io/leveldb-compaction-2/)
-- [leveldb之Compaction（3）－－选择参战文件](http://bean-li.github.io/leveldb-compaction-3/)
-- [leveldb源码分析--SSTable之Compaction - tgates - 博客园](https://www.cnblogs.com/KevinT/p/3819134.html)：关于源码的解读。因为每篇文章都是针对某一部分讲的很好，所以每篇文章都有一些可看之处。
-- [leveldb源码剖析----compaction - Swartz2015的专栏 - CSDN博客](https://blog.csdn.net/Swartz2015/article/details/67633724)：此文章有关于具体的 compaciton 执行过程的源码讲解。
-
-
-# todo
-1，下面是运行场景总结，但感觉乱，应该不会是这样。可能应该是 minor 只会在 使用空间超过 4M 时才会运行。其它的条件可能都是为了 major 
-
-
-运行时触发条件如下：
-- memtable 的使用空间超过 4M，并且 immemtable 已经被保存成 sstable 文件（即 immemtable == null）
-- MaybeScheduleCompaction 方法被调用。以下是调用 MaybeScheduleCompaction 方法的地方。
-  * Get
-  * Write
-  * BackgroundCall
-  * Open
-
-触发场景 1：
-在 Write 方法中，满足`触发条件 1`即可触发。
-
-触发场景 2：
-在 Write 方法中，满足`触发条件 1`，但没有调用 minor compaction 函数之前，调用了以下方法，先调用了 MaybeScheduleCompaction 函数。
-- Get
-- Write
-- BackgroundCall
-- Open
-
-> 感觉这个结构有点混乱，但根据源码总结出来的。很多文章对这块讲的都不太一样，不知道哪个对。
 

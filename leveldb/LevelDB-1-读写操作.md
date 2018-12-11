@@ -16,9 +16,13 @@ leveldb的一次写入分为两部分：
 > 其实leveldb仍然存在写入丢失的隐患。在写完日志文件以后，操作系统并不是直接将这些数据真正落到磁盘中，而是暂时留在操作系统缓存中，因此当用户写入操作完成，操作系统还未来得及落盘的情况下，发生系统宕机，就会造成写丢失；但是若只是进程异常退出，则不存在该问题。
 
 ## 1，写类型
-leveldb对外提供的写入接口有：（1）Put（2）Delete两种。这两种本质对应同一种操作，Delete操作同样会被转换成一个value为空的Put操作。
+leveldb对外提供的写入接口有以下三种。
+1. Put：对`单个` key/value 的写入。
+2. Delete：对`单个` key 的删除。本质也是增加数据，只是追加的数据是用来表示`该 key 已经删除`的意思。
+3. Write：批量进行 Put 和 Delete 操作。整个批次是原子操作。
 
-除此以外，leveldb还提供了一个批量处理的工具Batch，用户可以依据Batch来完成批量的数据库更新操作，且这些操作是原子性的。
+在实现中，Write 中的批量数据操作会变成一个 batch 一起来做，这样才保证原子性。而 Put 和 Delete 也会变成一个 batch，只不过 batch 中操作的数据只有一个。
+
 
 ### batch结构
 无论是Put/Del操作，还是批量操作，底层都会为这些操作创建一个batch实例作为一个数据库操作的最小执行单元。因此首先介绍一下batch的组织结构。
@@ -63,6 +67,7 @@ leveldb中，在面对并发写入时，做了一个处理的优化。在同一�
 
 ### 原子性
 leveldb的任意一个写操作（无论包含了多少次写），其原子性都是由日志文件实现的。一个写操作中所有的内容会以一个日志中的一条记录，作为最小单位写入。
+> 这里的写，是指 Write 方法。Write 方法可以一次写多个 key/value。
 
 考虑以下两种异常情况：
 - 写日志未开始，或写日志完成一半，进程异常退出；
@@ -123,10 +128,6 @@ leveldb读取分为三步：
 在memory db或者sstable的查找过程中，需要根据指定的序列号拼接一个internalKey，查找用户key一致，且seq号不大于指定seq的数据，具体的查找过程可见《内存数据库》和《sstable》两篇文章。
 
 
-
---------------------------- 文章到此结束 ---------------------------
----------
-
 # 个人总结
 # 一、写操作
 ## 1，写操作的中两步
@@ -156,17 +157,30 @@ RocketMQ 是谁都可以写到一块`内存区域`（并不是磁盘），但每
 RocketMQ 关于日志文件的异常情况处理有些不一样。RocketMQ 会为日志文件保存一个 checkpoint，来记录最后一次对日志文件保存的时间点。在恢复时，从 checkpoint 指定的时间点开始恢复，遇到不合法的数据就停止恢复。
 > RocketMQ 从 checkpoint 开始恢复，其实是从 3 个 checkpoint 中，找到最小的时间开始恢复。这么做的原因是为了创建 consumeQueue 和 index，防止数据存在，即无法进行消费。
 
+为什么 RocketMQ 要使用一个文件来保存 checkpoint 呢？
+因为 RocketMQ 要保存的三个数据的 checkpoint，所以使用一个文件来保存这三个 checkpoint。
+- message
+- consumer queue
+- index
+
 
 ## 6，snapshot
 看来 snapshot 最大的好处就是：让数据库并发的进行读写。但可能会有短暂的不一致现象。
 
-## 7，0 层 sstable 文件的查找
-在查找 0 层的 sstable 文件时，和翻译 LevelDB 那篇文章写的基本一致。要从最新的文件开始查找，因为 0 层的 sstable 就是 memtable 原样存储。0 层的文件中可能存在key重合的情况，最新的 sstable 中存储的总是最新的数据。
+## 7，`level 0`和`level 1~6` sstable 文件的查找
+先说一下 sstable 的一些特性，sstable 会有`最大 key`和`最小 key`两个属性，来表示出 sstable 保存的 key 的范围。所以在查看 key 是否在 sstable 中时，先看 key 是否在此 sstable 的`最大 key`和`最小 key`范围之内，如果在就进行查找；如果不在，就根本不找这个 sstable 了。
+
+在查找 level 0 的 sstable 文件时，和翻译 LevelDB 那篇文章写的基本一致。要从最新的文件开始查找，因为 level 0 的文件中存在key重合的情况，最新的 sstable 中存储的总是最新的数据（当然，前提是 key 在`最大 key`和`最小 key`范围之内）。
+
+在查找 level 1~6 时，在每一个 level 中的 sstable 内容都不存在重叠（但各个 level 之间会存在 sstable 内容的重叠）。所以在`某一个 level`中，查找 key 可能会在哪一个 sstable 中时，使用的是`折半查找`的方式。例如：
+有 5 个 sstable，key 的范围分别如下：
+- sstable 1：1~100
+- sstable 2：101~200
+- sstable 3：201~300
+- sstable 4：301~400
+- sstable 5：401~500
+
+假如 key 为 87，则先会在 sstable 1 到 sstable 5 中进行`折半查找`，结果是先查看是否在 sstable 3 中。比较之后发现比 sstable 3 的最小 key 还小，则在 sstable 1 和 sstable 2 中再进行折半查找，以此类推。
 
 ## 8，最后
 最后，虽然 RocketMQ 和 LevelDB 的性质不同，但可以看出还是有很多相似的处理方法。
-
-# 问题
-1，内存数据库是如何使用 internalKey 的呢？
-
-2，LevelDB 的是否被合并是什么意思？没有锁的情况下，能进行合并或被合并吗？
