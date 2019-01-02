@@ -57,6 +57,9 @@ BTree 有几个具体的问题：
 > 本质上，所有做的一切都是了为“磁盘顺序访问”，无“随机访问”。
 
 一些已知的树结构不需要`update-in-place`。最流行的是 append-only Btree，也被称作 copy-on-write tree。工作的方式是，每次写操作发生在文件尾部时，顺序地重写树结构。old tree 的相关部分，包括 top levle node，被孤立起来（不了解 copy-on-write tree 原理，所以不知道具体意思。。。）。通过这种方式，tree 顺序地重新生成他自己随着时间，`update-in-place`被避免。这种方式也会有一些个代价：每次写操作时，都要重写结构，这个过程很冗长。而且带了很显著的写操作。
+ ![在这里插入图片描述](https://img-blog.csdnimg.cn/20181212180613882.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L2hvdGR1c3Q=,size_16,color_FFFFFF,t_70)
+ 
+ 
  
 # 二、Base LSM 算法
 ## 1，基础
@@ -79,8 +82,7 @@ BTree 有几个具体的问题：
 即使使用 compaction ，读操作还会访问很多文件。大部分的实现会通过 Bloom filter 来避免这个问题。Bloom filter 在判断`文件是否包含 key`方面，是一个非常有效的基于内存算法。
 
 从`写操作`的角度来看，所有的`写操作`都被`批量处理`，并且`顺序地`写。另外，每一轮的 compaction 处理，都是对 IO 的损耗（不知道为什么来这么一句，感觉很突兀。。。）。然而读操作可能会在`读取一行数据`时，要读取一堆文件，这也是算法（Bloom filter）应该起作用的时候。我们用增加`随机读`的方式，来避免`随机写`的发生。这种交换是合理的，如果我们可以使用`bloom filters`和`hardware tricks（例如：linux page cache）`来优化读性能。
-![在这里插入图片描述](https://img-blog.csdn.net/20181019113345722?watermark/2/text/aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L2hvdGR1c3Q=/font/5a6L5L2T/fontsize/400/fill/I0JBQkFCMA==/dissolve/70)
-
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20181212180724431.png?x-oss-process=image/watermark,type_ZmFuZ3poZW5naGVpdGk,shadow_10,text_aHR0cHM6Ly9ibG9nLmNzZG4ubmV0L2hvdGR1c3Q=,size_16,color_FFFFFF,t_70)
 
 # 三，Compaction
 ## 1，Basic Compaction
@@ -124,7 +126,7 @@ LSM tree 处理于`journal/log`文件 和 `传统的、单一的、定长的 Ind
 # 六、超越 Levelled LSM
 现在有很多基于 LSM 方法的东西准备去做。Yahoo 开发了一个叫做“Pnuts”的系统，这个系统结合了 LSM 和 BTree，并且声称性能更好，但我没有看到这个算法被发表出来。IBM 和 Google 最近做了很多工作在类似的分支上。还有很多相关的方法，这些方法也有相似点，但保持了总体的结构，例如：Fractal Trees 和 Stratified Trees。
 
-LSM 结构只是一个选项，数据库使用了很多的不同选项。数据库提供`可插入的引擎`为不同的工作场景。Parquet 是一个非常流行的 HDFS 的替代品，在和 HDFS 相反方向上进展非常多（例如：通过`列格式`提高`聚合性能`）。MySQL 有一个`存储抽象`，这个的抽象可以使用很多不同的引擎，例如：基于 Toku fractal tree 的 Index（MongoDB 也可以使用）。Mongo 3.0 加入了 Wired Tiger 此区，这个引擎提供了 B+ 和 LSM 方法，这些方法和遗留引擎也兼容。一些关系型数据库有`可配置的 Index 结构`，这些结构使用不同的文件组织。
+LSM 结构只是一个选项，数据库使用了很多的不同选项。数据库提供`可插入的引擎`为不同的工作场景。Parquet 是一个非常流行的 HDFS 的替代品，在和 HDFS 相反方向上进展非常多（例如：通过`列格式`提高`聚合性能`）。MySQL 有一个`存储抽象`，这个的抽象可以使用很多不同的引擎，例如：基于 Toku fractal tree 的 Index（MongoDB 也可以使用）。Mongo 3.0 加入了 Wired Tiger 引擎，这个引擎提供了 B+ 和 LSM 方法，这些方法和遗留引擎也兼容。一些关系型数据库有`可配置的 Index 结构`，这些结构使用不同的文件组织。
 
 也可以考虑硬盘的使用。贵的 SSD 磁盘，例如 FusionIO，有非常高的随机写性能，适合`update-in-place`方式。便宜的 SSD 和机械磁盘适合 LSM，LSM 避免`小的、随机的访问`。
 
@@ -151,7 +153,7 @@ LSM 不是没有问题。它的最大问题（例如 GC）是，`collection phas
 
 **LSM 缺点：**
 1，读效率比 BTree 慢。读操作不得不在很多文件中进行查找，而不是从一个文件上查找。
-2，Compaction 产生的 IO 操作。
+2，Compaction 产生的 IO 操作。这种 IO 操作多时，会造成`写放大(write amplification)`，造成`读`和`写`变慢。
 
 
 ## 2，进行的写优化

@@ -5,8 +5,8 @@
 - [【算法导论33】跳跃表（Skip list）原理与java实现](https://blog.csdn.net/BrilliantEagle/article/details/52206261)：有一些例子说明，好理解。还有 Java 实现。
 
 
-# 内存数据库
-leveldb中内存数据库用来维护有序的key-value对，其底层是利用跳表实现，绝大多数操作（读／写）的时间复杂度均为O(log n)，有着与平衡树相媲美的操作效率，但是从实现的角度来说简单许多，因此在本文中将介绍一下内存数据库的实现细节。
+#  memtable 
+leveldb中 memtable 用来维护有序的key-value对，其底层是利用跳表实现，绝大多数操作（读／写）的时间复杂度均为O(log n)，有着与平衡树相媲美的操作效率，但是从实现的角度来说简单许多，因此在本文中将介绍一下 memtable 的实现细节。
 
 ## 跳表
 ### 概述
@@ -67,6 +67,12 @@ Skip lists are a data structure that can be used in place of balanced trees. Ski
 - 在合适的位置插入新节点（例如图中节点12与节点19之间），并依据查找时记录的前任节点信息，在每一层中，以链表插入的方式，将该节点插入到每一层的链接中。
 
 链表插入指：将当前节点的Next值置为前任节点的Next值，将前任节点的Next值替换为当前节点。
+
+#### 随机层高算法
+这个算法的核心是：
+> 每次产生一个随机数，然后对一个指定的数进行取余运算。如果余数为 0，则层高加 1，再进行一次前面的操作；如果余数不为 0，取当前计算的层高为最后的层高。
+
+下面的代码来看，`指定的数`为 4，`p.rnd.Int()`用来产生一个随机数。层高默认为 1，当余数为 0 时，就把层高加 1，但层高不能超过`最大层高`。
 ```
 func (p *DB) randHeight() (h int) {
     const branching = 4
@@ -84,23 +90,22 @@ func (p *DB) randHeight() (h int) {
 
 ### 迭代
 #### 1，向后遍历
-
 - 若迭代器刚被创建，则根据用户指定的查找范围[Start, Limit)找到一个符合条件的跳表节点；
 - 若迭代器处于中部，则取出上一次访问的跳表节点的后继节点，作为本次访问的跳表节点（后继节点为最底层的后继节点）；
 - 利用跳表节点信息（keyvalue数据偏移量，key，value值长度等），获取keyvalue数据；
-#### 2，向前遍历
 
+#### 2，向前遍历
 - 若迭代器刚被创建，则根据用户指定的查找范围[Start, Limit）在跳表中找到最后一个符合条件的跳表节点；
 - 若迭代器处于中部，则利用上一次访问的节点的key值，查找比该key值更小的跳表节点；
 利用跳表节点信息（keyvalue数据偏移量，key，value值长度等），获取keyvalue数据；
 
-## 内存数据库
-在介绍完跳表这种数据结构的组织原理以后，我们介绍leveldb如何利用跳表来构建一个高效的内存数据库。
+##  memtable 
+在介绍完跳表这种数据结构的组织原理以后，我们介绍leveldb如何利用跳表来构建一个高效的 memtable 。
 
 ### 键值编码
-在介绍内存数据库之前，首先介绍一下内存数据库的键值编码规则。由于内存数据库本质是一个kv集合，且所有的数据项都是依据key值排序的，因此键值的编码规则尤为关键。
+在介绍 memtable 之前，首先介绍一下 memtable 的键值编码规则。由于 memtable 本质是一个kv集合，且所有的数据项都是依据key值排序的，因此键值的编码规则尤为关键。
 
-内存数据库中，key称为internalKey，其由三部分组成：
+ memtable 中，key称为internalKey，其由三部分组成：
 - 用户定义的key：这个key值也就是原生的key值；
 - 序列号：leveldb中，每一次写操作都有一个sequence number，标志着写入操作的先后顺序。由于在leveldb中，可能会有多条相同key的数据项同时存储在数据库中，因此需要有一个序列号来标识这些数据项的新旧情况。序列号最大的数据项为最新值；
 - 类型：标志本条数据项的类型，为更新还是删除；
@@ -109,7 +114,7 @@ func (p *DB) randHeight() (h int) {
 
 
 ### 键值比较
-内存数据库中所有的数据项都是按照键值比较规则进行排序的。这个比较规则可以由用户自己定制，也可以使用系统默认的。在这里介绍一下系统默认的比较规则。
+ memtable 中所有的数据项都是按照键值比较规则进行排序的。这个比较规则可以由用户自己定制，也可以使用系统默认的。在这里介绍一下系统默认的比较规则。
 
 默认的比较规则：
 - 首先按照字典序比较用户定义的key（ukey），若用户定义key值大，整个internalKey就大；
@@ -152,51 +157,28 @@ memtable 接收到的数据格式和`日志`接收到的数据格式是一样的
 ![leveldb_get_key](media/leveldb_get_key.png)
 
 
-### 数据组织
-以goleveldb为示例，内存数据库的定义如下：
-```
-type DB struct {
-    cmp comparer.BasicComparer
-    rnd *rand.Rand
-
-    mu     sync.RWMutex
-    kvData []byte
-    // Node data:
-    // [0]         : KV offset
-    // [1]         : Key length
-    // [2]         : Value length
-    // [3]         : Height
-    // [3..height] : Next nodes
-    nodeData  []int
-    prevNode  [tMaxHeight]int
-    maxHeight int
-    n         int
-    kvSize    int
-}
-```
-其中kvData用来存储每一条数据项的key-value数据，nodeData用来存储每个跳表节点的链接信息。
-
-nodeData中，每个跳表节点占用一段连续的存储空间，每一个字节分别用来存储特定的跳表节点信息。
-
-- 第一个字节用来存储本节点key-value数据在kvData中对应的偏移量；
-- 第二个字节用来存储本节点key值长度；
-- 第三个字节用来存储本节点value值长度；
-- 第四个字节用来存储本节点的层高；
-- 第五个字节开始，用来存储每一层对应的下一个节点的索引值；
 
 ### 基本操作
 Put、Get、Delete、Iterator等操作均依赖于底层的跳表的基本操作实现，不再赘述。
 
 # 个人总结
-## 1，关于内存数据库
-在内存数据库中，最重要的就是 skiplist 的实现了，因为它是 memtable 的核心逻辑。
+## 1，关于 memtable 
+在 memtable 中，最重要的就是 skiplist 的实现了，因为它是 memtable 的核心逻辑。
 
 除此之外，还有一点就是 internal_key 了。在 skiplist 进行比较 key 时，是拿 internal_key 进行比较。sequence number 起到了版本控制作用。
 
 ## 2，关于 varint 编码
 在保存 key 和 value 的 size 字段时，对 size 使用了 varint 编码，当 key 和 value 都不大时，可以节省一些空间。
 
-## 3，写 memtable 代码
+# 参考
+- [MemTable与SkipList-leveldb源码剖析(3)](http://www.pandademo.com/2016/03/memtable-and-skiplist-leveldb-source-dissect-3/)：源码解析的文章，这篇文章有的图是从这里找的，有不明白可以去找找。
+- [Leveldb源码笔记之读操作](http://blog.1feng.me/2016/09/10/leveldb-read/)：源码解析的文章，这篇文章有的图是从这里找的，有不明白可以去找找。
+- [leveldb中的memtable](http://bean-li.github.io/leveldb-memtable/)：源码解析的文章，引用了上两篇文章中的图。
+- [LevelDB：写操作](https://www.jianshu.com/p/8639b21cb802)：简单介绍写的主要流程，并指明是哪行代码，方便理解。
+
+
+
+# 源码阅读
 1，
 文件：db_impl.cc
 方法：`Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) `
@@ -313,13 +295,3 @@ void MemTable::Add(SequenceNumber s, ValueType type,
   table_.Insert(buf);
 }
 ```
-
-# 问题：
-1，sequence number 是如何使用的？在插入和查询时，都是如何取得这个值的？
-
-
-# 参考
-- [MemTable与SkipList-leveldb源码剖析(3)](http://www.pandademo.com/2016/03/memtable-and-skiplist-leveldb-source-dissect-3/)：源码解析的文章，这篇文章有的图是从这里找的，有不明白可以去找找。
-- [Leveldb源码笔记之读操作](http://blog.1feng.me/2016/09/10/leveldb-read/)：源码解析的文章，这篇文章有的图是从这里找的，有不明白可以去找找。
-- [leveldb中的memtable](http://bean-li.github.io/leveldb-memtable/)：源码解析的文章，引用了上两篇文章中的图。
-- [LevelDB：写操作](https://www.jianshu.com/p/8639b21cb802)：简单介绍写的主要流程，并指明是哪行代码，方便理解。

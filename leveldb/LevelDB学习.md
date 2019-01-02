@@ -32,3 +32,17 @@ BTree 有很多变形，例如：B+Tree、B*Tree。只要像下面这样保存�
 可能会有更好的性能，原因如下：
 - 可以保证 Compaction 时的归并排序的快速性。因为 skiplist 的数据是顺序存储的，在归并排序时非常快。BTree 也做成数据顺序存储，也可以非常快。
 - 还可以提高查询速度。因为 BTree 查询速度是 $log_{m}^{n}$，而 skiplist 是接近 $log_{2}^{n}$。
+
+
+# 设计总结
+## 1，为什么要分层，有什么好处
+个人想法，比较底的 level (例如：level-0,1...)保存的是比较新的数据。比较新的数据被读的可能性大，所以放在比较底的 level 中可以加快查找。
+参考：
+下面这个文章中的`I think it is mostly to do with easy and quick merging of levels.`的答案感觉比较对，最上面的答案感觉一般。
+[Why does LevelDB needs more than two levels? - Stack Overflow](https://stackoverflow.com/questions/14305113/why-does-leveldb-needs-more-than-two-levels)
+
+
+在网上还查到一个 RiakDB，这个好像是基于 levelDB 做的。这个在分层上做出的改变是，可以把`底 level(0,1..)`和`高 level(..5,6)`中的数据，放到不同的磁盘上。`底 level(0,1..)`的 compaction 比较多，所以可以使用 SSD 磁盘；而`高 level(..5,6)`的 compaction 比较少，即写操作比较少，就可以使用机械磁盘。
+参考：
+[LevelDB](http://docs.basho.com/riak/kv/2.2.3/setup/planning/backend/leveldb/)
+

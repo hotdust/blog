@@ -1,6 +1,4 @@
 # 前言
-
-# 说明
 因为有很多专有名词和类名相同或类似，做以下分区。
 - 有空格分隔的单词为专有名词。例如：LRU Cache 是指 LRU 类的 Cache。
 - 没有有空格分隔的单词为类名，或其它程序的名字。例如：LRUCache，为程序中的类名。
@@ -11,11 +9,10 @@
 - data_block 缓存（以下称 Block Cache）：缓存 打开的 sstable 中的 data_block 数据。
 
 
-各自特点如下：
 关于 Table Cache
 - 使用 LRU Cache 做为具体实现。
 - cache 的 key 为 `file_number 和 file_number 的 size`。`file_number`为一个自增数，每创建一个文件自增一次。
-- 每个 DB 只有一个 Table Cache，是 DB 模块的一个属性，在构造函数中被初始化。VersionSet 也有一个 Table Cache，这个 Table Cache 是 DB 模块传过去的`唯一 TableCache 的；引用`。
+- 每个 DB 只有一个 Table Cache，是 DB 模块的一个属性，在构造函数中被初始化。VersionSet 也有一个 Table Cache，这个 Table Cache 是 DB 模块传过去的引用。
 - 在读取 sstable 时会看是否有 TableCache 存在，如果有就使用，如果没有就加到 TableCache 里。
 
 关于 Block Cache
@@ -27,29 +24,37 @@
 现在两个缓存的作用大概都清楚了，下面让我们看一下他们都使用的 LRU Cache。
 
 # LRU Cache
-简单的说一下这个 LRU Cache 的结构和原理：
-- 是由两个类似 Java 的 HashMap 嵌套组成的。HashMap 的组成是一个数组，每个数组结点上是一个链表，链表上保存具体的元素。而 LRU Cache 也是有一数组，只是数组的每个结点是一个 HashMap。
-- LRU Cache 的数组的每个结点上的操作，是线程安全的。这点和 Java 的 HashMap 的机制一样。
-- 自动扩容是以 LRU Cache 的数组的每个结点为单位进行扩容的。
-- LRU Cache 的数组的每个结点上，除了有一个 HashMap，还有两个链表。这两个链表来控制到达 LRU 的限制后，如何删除缓存数据。
+LRU Cache 结构图如下：
+![lrucache_arch](media/lrucache_arch.png)
+
+
+
+简单的说一下这个 LRU Cache 的结构：
+- Hash 部分：是由类似 Java 的 HashMap 嵌套组成的。HashMap 的组成是一个数组，每个数组结点（Bucket）上是一个链表，链表上保存具体的元素（上图 Hash 部分的绿色部分）。另一个 HashMap 是上图蓝色部分，这个 HashMap 的 Bucket 装的不是具体元素，而是一个 HashMap。
+- 链表部分：这里的链表部分不是指 HashMap 的 Bucket 里的链表，而是独立的两个链表（上图的链表部分）。这两个独立的链表部分名为`in_use`和`lru`，这两个链表按`时间先后顺序`把所有的数据都连接起来。这两个链表来控制到达 LRU 的限制后，如何删除缓存数据。
+
+下面是 LRU Cache 的一些特点：
+- LRU Cache 的外部 HashMap(蓝色部分) 的 Bucket 中的数据操作，是线程安全的。这点和 Java 的 HashMap 的机制一样。
+- 自动扩容是以 LRU Cache 的外部 HashMap(蓝色部分) 的`每个 Bucket`为单位进行扩容的。
 - 使用`引用计数`的方式控制元素的删除。
 
+
 这个结构的优点：
-- 在查找时，从 HashMap 进行查找，时间复杂度为：O(n/(s1+s2))。n 为元素的个数，s1 为 LRU Cache 中的数组的个数，s2 为 HashMap 中数组的个数。
-- 删除时，从链表进行删除，时间复杂度为 O(1)。因为 1 次就可以定位要删除结点的开始结点。
+- 查找时：从 HashMap 进行查找，时间复杂度为：O(n/(s1+s2))。n 为元素的个数，s1 为 LRU Cache 中的数组的个数，s2 为 HashMap 中数组的个数。如果只使用两个链表的话，查找一个元素需要 O(n)。
+- 删除时：因为链表是按时间排序的，所以从链表进行删除，时间复杂度为 O(1)。因为 1 次就可以定位要删除结点的开始结点。如果没有链表的话，HashMap 是没有维持`时间顺序`的，所以删除操作需要 O(n)。
 
 LRU Cache 很好的利用了 Hash 和 链表的特点，以空间换时间，实现最小时间复杂度。
 
 ## LRU Cache 的实现结构
 整个 LRU Cache 由 4 个类组成，每个类的作用如下：
-- LRUHandle：链表中的每个 node。有 refs(计数引用)、in_cache(是否在那两个链表中) data 等以我自己。
-- HandleTable：类似于 HashMap，内部有一个数组，数组每个结点都是一个链表，来保存具体元素。
+- LRUHandle：链表中的每个 node。有 refs(计数引用)、in_cache(是否在那两个链表中) data 等属性。
+- HandleTable：类似于 HashMap，内部有一个数组，数组每个结点都是一个链表，来保存具体元素（图中的绿色部分）。
 - LRUCache：是对 HandleTable 的一个包装，并且加入了用作 LRU 操作的两个链表：in_use_ 和 lru_。并且在这里，对并发操作进行同步处理，每次只有一个线程能进行对 HandleTable 的操作。
-- ShardedLRUCache：相当于在 HashMap 上又套了一层。内部有一个数组，数组的每一个元素是一个 LRUCache。也就是说，要定位一个 key 时，需要进行至少进行两次定位操作：1，在 ShardedLRUCache 中定位在哪个 LRUCache。2，在 LRUCache 的 HandleTable 中定位在哪个数组结点上。
+- ShardedLRUCache：相当于在 HashMap 上又套了一层（图中蓝色部分）。内部有一个数组，数组的每一个元素是一个 LRUCache。也就是说，要定位一个 key 时，需要进行至少进行两次定位操作：1，在 ShardedLRUCache 中定位在哪个 LRUCache。2，在 LRUCache 的 HandleTable 中定位在哪个数组结点上。
 
 
 ### ShardedLRUCache
-我们先来说说 ShardedLRUCache，这个类的成员比较少：
+我们先来说说 ShardedLRUCache，这个类的成员比较少，对应图中蓝色 hashmap 部分：
 - LRUCache shard_[kNumShards]：实现 Hash 结构中的数组，每个结点类型为 LRUCache。
 - port::Mutex id_mutex_：生成`唯一ID`时所使用的锁。
 - uint64_t last_id_：自增的`唯一ID`。在生产新的 Table Cache 时使用，每个 Table Cache 中的 Table 都有一个唯一ID，用作和 Blcok Cache 中的 data_block 进行关联。
@@ -204,6 +209,18 @@ Table 的内容的取得（InternalGet 和 NewIterator 方法；），基本上�
 
 但会随着超过 LRUCache 的大小时，删除 data_block。
 
+## 8，关于嵌套 HashMap 的分桶策略
+你可能会注意到，`外层 HashMap`的分桶策略和`内层 HashMap`的分桶策略不太一样。
+
+- HandleTable：`hash%length`取余的方式。实际代码是`hash & (length_ - 1)`，效果是一样的。
+- ShardedLRUCache：取 hash 值的前 4 位。实际代码是`hash >> (32 - kNumShardBits)`。
+
+为什么分桶策略不一样的呢？如果两个 hashmap 的分桶策略一样，而且桶的个数也一样的话，第二层 hashmap 中的很多桶都不可能有值，两次分桶的意义可能就不太大了。例如：
+> 
+前提有一个嵌套的 hashmap，内层和外层 hashmap 都有 4 个桶，分桶策略都是`hash%4`的方式。
+>
+当 hash 值为 1 时，对于外层 hashmap，`1 % 4 = 1`分到 1 号桶中。对于内层 hashmap，`1 % 4 = 1`还是分到 1 号桶中。想一想，什么情况下数据会分到内层 hashmap 的 0 号桶中呢？没有可能，因为分桶策略都是一样的，2 和 3 号桶也是一样。
+
 
 # 个人总线：
 ## 1，LRUCache 结构的优点
@@ -222,6 +239,7 @@ Table 的内容的取得（InternalGet 和 NewIterator 方法；），基本上�
 **那什么时候删除“使用引用计数的缓存”呢？怎么删除呢？**
 1. 可以在要删除时，把引用减 1，然后判断是否还`引用==0`。如果为 0 说明没有地方再引用它了，就删除掉；如果不为 0，就先不管了。
 2. 每个地方在使用完这个缓存后，做一次 1 中的`把引用减 1，然后判断 引用==0 ...`的操作。
+
 
 
 # 参考：

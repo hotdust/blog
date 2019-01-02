@@ -353,7 +353,58 @@ consumerParams.put("heartbeat.interval.ms", sessionTimeout / 3);
 
 这是一个参数设置的文章，以后有问题时候，可以看看：[Optimizing Spark Streaming applications reading data from Apache Kafka - Stratio Blog](https://www.stratio.com/blog/optimizing-spark-streaming-applications-apache-kafka/)
 
+### 问题2
+把 session.timeout 修改成大于 batchDuration 时间后，出现了新问题。有时候每分钟从 kafka 接收的记录数，是前一分钟的 2 倍或 3 倍的情况。而下一分钟的数据又非常非常少，例如：
+> 18:19:00 400000
+> 18:20:00 900000
+> 18:21:00 80
 
+原因是同时执行了两个 spark 程序，同时从不同的 topic 里消费数据，但 consumerGroup 确是一样的。结果是，第二个程序启动时，因为和第一个程序是同一个 consumerGroup，所以要重新分配 partition。第二个程序启动时发起 rebalance，它很快可以读到自己 topic 的数据，但第一个程序因为是同一个 consumerGroup，所以也需要进行 rebalance，虽然它读的 topic 和第二个程序不一样。在 rebalance 时，第一个程序的 consumer 发生了 session.timeout，在 session.timeout 时间后，又可以读取到记录。
+
+因为时间差问题，第一个程序执行完 rebalace 之后，可能又会影响第二个程序，发生 rebalance。之后第二个程序又影响第一个程序，可能会反复进行。下面是 server.log 里的内容，会看到不断进行 rebalance。
+```
+# session.timout 时间是 1m50s
+
+
+[2018-12-17 17:51:50,010] INFO [GroupCoordinator 1]: Assignment received from leader for group cloud_aggregation for generation 292 (kafka.coordinator.GroupCoordinator)
+
+# 此处发生 session.timeout，从 52:00 开始，到 53:50。
+# 以下都是因为两个程序互相影响，发生的 consumer rebalance。
+[2018-12-17 17:52:00,003] INFO [GroupCoordinator 1]: Preparing to restabilize group cloud_aggregation with old generation 292 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 17:53:50,004] INFO [GroupCoordinator 1]: Stabilized group cloud_aggregation generation 293 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 17:53:50,008] INFO [GroupCoordinator 1]: Assignment received from leader for group cloud_aggregation for generation 293 (kafka.coordinator.GroupCoordinator)
+
+[2018-12-17 17:54:00,003] INFO [GroupCoordinator 1]: Preparing to restabilize group cloud_aggregation with old generation 293 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 17:55:50,005] INFO [GroupCoordinator 1]: Stabilized group cloud_aggregation generation 294 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 17:55:50,009] INFO [GroupCoordinator 1]: Assignment received from leader for group cloud_aggregation for generation 294 (kafka.coordinator.GroupCoordinator)
+
+[2018-12-17 17:56:00,004] INFO [GroupCoordinator 1]: Preparing to restabilize group cloud_aggregation with old generation 294 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 17:57:50,005] INFO [GroupCoordinator 1]: Stabilized group cloud_aggregation generation 295 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 17:57:50,010] INFO [GroupCoordinator 1]: Assignment received from leader for group cloud_aggregation for generation 295 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 17:58:00,001] INFO [GroupCoordinator 1]: Preparing to restabilize group cloud_aggregation with old generation 295 (kafka.coordinator.GroupCoordinator)
+^@^@^@[2018-12-17 17:59:50,002] INFO [GroupCoordinator 1]: Stabilized group cloud_aggregation generation 296 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 17:59:50,007] INFO [GroupCoordinator 1]: Assignment received from leader for group cloud_aggregation for generation 296 (kafka.coordinator.GroupCoordinator)
+^@[2018-12-17 18:00:00,004] INFO [GroupCoordinator 1]: Preparing to restabilize group cloud_aggregation with old generation 296 (kafka.coordinator.GroupCoordinator)
+^@^@^@[2018-12-17 18:01:50,017] INFO [GroupCoordinator 1]: Stabilized group cloud_aggregation generation 297 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 18:01:50,023] INFO [GroupCoordinator 1]: Assignment received from leader for group cloud_aggregation for generation 297 (kafka.coordinator.GroupCoordinator)
+^@[2018-12-17 18:02:00,001] INFO [GroupCoordinator 1]: Preparing to restabilize group cloud_aggregation with old generation 297 (kafka.coordinator.GroupCoordinator)
+
+
+
+
+^@[2018-12-17 18:03:00,006] INFO [GroupCoordinator 1]: Stabilized group cloud_aggregation generation 298 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 18:03:00,011] INFO [GroupCoordinator 1]: Assignment received from leader for group cloud_aggregation for generation 298 (kafka.coordinator.GroupCoordinator)
+^@^@^@^@[2018-12-17 18:05:02,697] INFO [GroupCoordinator 1]: Preparing to restabilize group cloud_aggregation with old generation 298 (kafka.coordinator.GroupCoordinator)
+^@^@^@[2018-12-17 18:06:52,699] INFO [GroupCoordinator 1]: Group cloud_aggregation with generation 299 is now empty (kafka.coordinator.GroupCoordinator)
+^@[2018-12-17 18:07:00,003] INFO [GroupCoordinator 1]: Preparing to restabilize group cloud_aggregation with old generation 299 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 18:07:00,004] INFO [GroupCoordinator 1]: Stabilized group cloud_aggregation generation 300 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 18:07:00,004] INFO [GroupCoordinator 1]: Preparing to restabilize group cloud_aggregation with old generation 300 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 18:07:00,009] INFO [GroupCoordinator 1]: Stabilized group cloud_aggregation generation 301 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 18:07:00,014] INFO [GroupCoordinator 1]: Assignment received from leader for group cloud_aggregation for generation 301 (kafka.coordinator.GroupCoordinator)
+^@[2018-12-17 18:07:50,002] INFO [GroupCoordinator 1]: Preparing to restabilize group cloud_aggregation with old generation 301 (kafka.coordinator.GroupCoordinator)
+^@^@^@[2018-12-17 18:09:00,006] INFO [GroupCoordinator 1]: Stabilized group cloud_aggregation generation 302 (kafka.coordinator.GroupCoordinator)
+[2018-12-17 18:09:00,009] INFO [GroupCoordinator 1]: Assignment received from leader for group cloud_aggregation for generation 302 (kafka.coordinator.GroupCoordinator)
+```
 
 
 ## 25，spark streaming 从 kafka 里读取数据时，executor、cores 和 memory 应该如何设置？
@@ -420,10 +471,8 @@ executor | cores | partition | 读取方式
  - [Spark Streaming + Kafka Integration Guide](https://spark.apache.org/docs/2.2.0/streaming-kafka-0-10-integration.html#storing-offsets)：官方的方法，不错。
 
 ## 27，如何优雅关闭，不丢失消息
- - [Spark Streaming优雅的关闭策略优化](http://qindongliang.iteye.com/blog/2404100)
-
- 
-  - [Spark streaming 设计与实现剖析](https://mp.weixin.qq.com/s?__biz=MzI3MjY2MTYzMA==&mid=2247483758&idx=1&sn=acd78535a2398f7109087256f3a06b15&scene=21#wechat_redirect)
+- [Spark Streaming优雅的关闭策略优化](http://qindongliang.iteye.com/blog/2404100)
+- [Spark streaming 设计与实现剖析](https://mp.weixin.qq.com/s?__biz=MzI3MjY2MTYzMA==&mid=2247483758&idx=1&sn=acd78535a2398f7109087256f3a06b15&scene=21#wechat_redirect)
 
 
 ## 28，如何删除 spark application history

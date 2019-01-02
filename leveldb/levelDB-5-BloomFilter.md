@@ -35,12 +35,12 @@ Burton Howard Bloom 在1970年设计的数据结构，用来判断某个key是�
 
 因此判断集合的大小，选择合适size的bloom filter位图就成了效率的关键。
 
-如果位图中的bit数位为m，集合中的元素为n，hash函数的个数为k，那么虚警概率
+**如果位图中的bit数位为m，集合中的元素为n，hash函数的个数为k，那么虚警概率**
 ![bloom_filter_false_positive_p](media/bloom_filter_false_positive_p.png)
 
 
 
-如果m 和n 是确定的，那么最优的k为：
+如果 `m(位个数)` 和 `n(元素个数)` 是确定的，那么最优的 `k(hash 函数个数)` 为：
 --
 
 ![best_k_in_bloom_filte](media/best_k_in_bloom_filter.png)
@@ -55,7 +55,7 @@ m n k 组合下，相关虚警概率的情况如下：
 
 (数据来源于 [Bloom Filters - the math](http://pages.cs.wisc.edu/~cao/papers/summary-cache/node8.html#SECTION00053000000000000000))
 
-很明显，如果hash 函数的个数太多，就会带来更多的运算，这显然是不合理的，因此，要想降低虚警概率，必须要m／n要尽可能的大，
+很明显，如果 hash 函数的个数太多，就会带来更多的运算，这显然是不合理的，因此，要想降低虚警概率，必须要m／n要尽可能的大，
 
 如果m／n等于20的时候，3个hash函数就可以将虚警概率降低到千分之三左右，4个hash 函数就能将虚警概率控制在千分之一左右。
 
@@ -68,7 +68,7 @@ leveldb中的bloom filter有第二个层面的改进，即采用了下面论文�
 
 [Less Hashing, Same Performance: Building a Better Bloom Filter](https://www.eecs.harvard.edu/~michaelm/postscripts/rsa2008.pdf)
 
-这个论文有兴趣的同学可以读一下，我简单summary一下论文的思想，为了尽可能的降低虚概率，最优的hash函数个数可能很高，比如需要10个hash函数，这势必带来很多的计算，而且要设计多个不同的hash函数，论文提供了一个思想，用1个hash函数，多次移位和加法，达到多个hash 的结果。
+这个论文有兴趣的同学可以读一下，我简单summary一下论文的思想，为了尽可能的降低虚概率，最优的hash函数个数可能很高，比如需要10个hash函数，这势必带来很多的计算，而且要设计多个不同的hash函数，论文提供了一个思想，用1个hash函数，通过`多次移位和加法`，达到多个hash 的结果。
 
 ## 1，bloom filter 参数设定
 levelDB 是先决定 m/n 的值，通过 m/n 的值反过来定 m 和 k 的大小。我们看看是如何做的：
@@ -153,7 +153,7 @@ levelDB 的 bloom filter 是针对固定大小的。这个 n 就是每次生产 
 ## 2，生成 filter 和 filter offset 的流程
 具体的生成 filter 和 filter offset 的流程如下：
 - 如果`当前 data_block 没有生成完对应的 filter`，就开始进行生成 filter。`当前 data_block 没有生成完对应的 filter` 的判断条件是：`data_block offset / filter 默认大小(2K) > filter_offsets size`。
-  * data_block offset：就是 data_block 写到内存后，尾部的 offset。例如：当前内存数据为 10K，写入 4K 的 data_block，传入的 data_block offset 为 14K。
+  * data_block offset：就是 data_block 写到内存后，尾部的 offset。例如：当前内存有 10K 的数据，在此基础上写入 4K 的 data_block，传入的 data_block offset 为 14K。
   * filter_offsets size：filter offset 的个数
 - 如果现在`当前 data_block`生成 filter 循环中的第一次。
   * 把 filter_block 的 size 保存到 filter_offsets 中。size 被当成 offset 使用。
@@ -215,18 +215,19 @@ levelDB 的 bloom filter 是针对固定大小的。这个 n 就是每次生产 
 3. 通过 filter_offsets[0] 和 filter_offsets[1] 的位置，取得 filter 数据。然后把 filter 和 key 传给 bloom filter 进行判断。
 
 # 个人总结
-1，避免生成不足 1 字节的内存
+## 1，避免生成不足 1 字节的内存
 在生成 bitmap 时，为了避免生产不足 1 字节的内存，使用`bits + 7) / 8`的方式来扩充到 1 字节。
 
-2，位图数据的最后一字节
+## 2，位图数据的最后一字节
 把做 hash 的次数 k 保存到了 bitmap 的最后一个单位（size_t）。对于一些可能变化，对结构产生影响的变量，为保险起见，保存在数据里，而不是使用代码中的值。
 
-3，那个 bloom filter 的 hash 算法
+## 3，那个 bloom filter 的 hash 算法
 计算“哪个位设置成 1”的算法中，不是只使用一次 hash 后的值，而是使用再加上一个`增量(delta)`，而这个`增量`也不是固定的。这种方法和`hash 的开放导址法`有点像。
 
 `开放导址法`就是使用了`两个` hash 函数来确认 hash 后的位置。虽然此算法中没有使用再次 hash 函数，但也是基于 key 又进行了一次变化（虽然 bloom filter 中是基于 hash 值的变化，但 hash 值也是通过 key 生成的，本质上也是基于 key 的变化）。
 
-4，为什么 filter 的生成，是根据 data_block 的大小，而不是根据 key/value 的个数呢？可能是因为 data_block 的按`一定大小`生成的，data_block 中并没有保存 key/value 的个数。如果要以 key/value 的个数生成 filter 的话，需要再加一个`个数`统计，结构会变复杂一些。
+## 4，为什么 filter 的生成，是根据 data_block 的大小，而不是根据 key/value 的个数呢？
+可能是因为 data_block 的按`一定大小`生成的，data_block 中并没有保存 key/value 的个数。如果要以 key/value 的个数生成 filter 的话，需要再加一个`个数`统计，结构会变复杂一些。
 
 
 
