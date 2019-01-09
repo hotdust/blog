@@ -11,7 +11,13 @@
 ## 学习
 - [如何从零写一个kv数据库？ - 知乎](https://www.zhihu.com/question/59469744)：说了学习写 kv 存储的方法
 - [Implementing a Key-Value Store | Code Capsule](http://codecapsule.com/2012/11/07/ikvs-implementing-a-key-value-store-table-of-contents/)：一个教你写 kv 存储的博客
-- 
+- [Neo的技术博客 阿里云第一届PolarDB数据库性能大赛Java排名第一分享 |](http://neoremind.com/2018/12/2018-polar-race-java-no-1/)：PolarDB数据库性能大赛Java排名第一分享
+- [PolarDB数据库性能大赛Java选手分享 | 徐靖峰|个人博客](https://www.cnkirito.moe/polardb-race/)：PolarDB数据库性能大赛Java另一个分享。
+
+# 博客
+- [Neo的技术博客](http://neoremind.com/)
+- [徐靖峰|个人博客](https://www.cnkirito.moe/)
+
 
 ## redis
 Redis 内存结构是把各个 key 存在了 Hashtable 中。
