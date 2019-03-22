@@ -66,7 +66,10 @@ static const int kMaxMemCompactLevel = 2;
 
 
 ##### (1) 为什么`level 较小的`有 key 重叠就放到`level 较小的`的上面呢？（例如，如果 level 0 上有重叠，就放到 level 0 上）
-对于 level 0，因为 level 0 是可以有重叠的 sstable 的，所以要顺序查找每个 sstable。这样放在 level 0 可以更快的查找到重叠的 key。
+~~对于 level 0，因为 level 0 是可以有重叠的 sstable 的，所以要顺序查找每个 sstable。这样放在 level 0 可以更快的查找到重叠的 key。~~
+~~既然 level 0 上有重叠的 key，那么在 minor compaction 时可以合并 key 范围重叠的文件，避免空间浪费。~~
+
+如果 level 0 上有重叠，而不放在 level 0 上，则可能发生`取得旧 key`问题。例如：在 level 0 上有一个 sstable 文件中，有一个 key=aaa 的数据。如果新的 sstable 也有一个 key=aaa 的数据，却放在了 level 1 或 2 上，这样在查找 key=aaa 的数据时，就会从 level 0 的 sstable 上取得旧的数据。
 
 对于 level 1,2，因为 level 0 以外的 level 上，不允许有 key 重叠的 sstable，所以如果在 level 1,2 有重叠的话，就要放到 level 0上。
 
@@ -154,8 +157,10 @@ if (f->allowed_seeks < 100) f->allowed_seeks = 100;
 大概意思是说，如果一个 sstable seek 不到 N 次的话，那么这 N 所花费的时间 和 把这个 sstable 进行 compaction 所花费的时间差不多。为了不在这个 sstable 上继续浪费时间，就把它 compaction，这样就会减少文件打开。
 
 什么场景下会产生这种查很多次查不到呢？可能会有两个场景：
-- 热点数据：如果在一个 sstable 上进行查找的话，`要找的 key`肯定在此 sstable 的`最大 key`和`最小 key`之间。但经过查找还找不到数据，说明此 sstable 可能不包含`热点数据`(就是经常被使用的数据)。如果不包含热点数据，还经常读它的话，浪费文件打开时间和缓存等资源。
-- key 范围重叠。文章（[leveldb之Compaction (2)--何时需要Compaction](http://bean-li.github.io/leveldb-compaction-2/)）上说是原因是有严重的重叠。确实重叠才产生这种问题的一个原因。例如：level 1 sstable 的 key 小范围是 30~100，level 2 sstable 范围是 40~110，但 level 1 上只有 30 和 100 两个 key，而 level 2 上有 很多 key，这时候是范围重叠原因。但如果 level 1 有很多 key，而 level 2 上 key 很少，还发生了 level 1 上 seek miss，这时候可能是热点数据的原因。
+- key 范围严重重叠。文章（[leveldb之Compaction (2)--何时需要Compaction](http://bean-li.github.io/leveldb-compaction-2/)）上说是原因是有严重的重叠。确实重叠才产生这种问题的一个原因。例如：level 1 sstable 的 key 小范围是 30~100，level 2 sstable 范围是 40~110，但 level 1 上只有 30 和 100 两个 key，而 level 2 上有 很多 key，这时候是范围重叠原因。但如果 level 1 有很多 key，而 level 2 上 key 很少，还发生了 level 1 上 seek miss，这时候可能是热点数据的原因。
+
+~~- 热点数据：如果在一个 sstable 上进行查找的话，`要找的 key`肯定在此 sstable 的`最大 key`和`最小 key`之间。但经过查找还找不到数据，说明此 sstable 可能不包含`热点数据`(就是经常被使用的数据)。如果不包含热点数据，还经常读它的话，浪费文件打开时间和缓存等资源。~~
+应该和热点数据没有太多关系，热点数据一般都会保存到 cache 里。
 
 > seek 是怎么一个过程呢？seek 过程就是一个 sstable 的查找过程，先使用 filter_block 查找，有可能还对具体的 data_block 进行查找。
 
@@ -176,7 +181,7 @@ if (f->allowed_seeks < 100) f->allowed_seeks = 100;
 todo 那为什么LevelDB非要搞出来level 0 ～level 6 这么多的层级呢？就level 0和level 1不好吗？
 
 
-## 如何选取哪此文件进行 Compaction
+## 如何选取哪些文件进行 Compaction
 Compaction 的过程就是`选取 level n 和 level n+1 的 sstable`，然后进行合并。但 Compaction 根据触发条件不一样，在 level n 进行 Compaction 的文件也不一样。下面细说一下，主要分成以下部分进行说明：
 - level n 层文件选取
 - level n+1 层文件选取

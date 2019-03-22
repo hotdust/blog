@@ -295,9 +295,9 @@ public PutMessageResult putMessage(MessageExtBrokerInner msg) {
 ```
 
 其中，判断 OSPageCache 是否是繁忙状态这里，进行细说一下。
-在每次写消息到 buffer 之前，会记录一个开始时间，在写消息到 buffer 之后，就会把这个开始时间清 0。在本次写消息到 buffer 之前，会取得一下上次的开始时间，如果`当前系统时间 - 这个开始时间 > 指定繁忙时间` 的话，就说明写 page cache 繁忙。还有两点要注意一下：
+在每次写消息到 buffer 之前，会记录一个开始时间，在写完消息到 buffer 之后，就会把这个开始时间清 0。在本次写消息到 buffer 之前，会取得`上次写消息时设置的开始时间`，如果`当前系统时间 - 上次写消息设置的开始时间`在一个`指定区间内`的话，就说明写 page cache 繁忙。还有两点要注意一下：
 
-- 因为`写消息到 buffer`处理是一个串行处理（使用阻塞或非阻塞锁保证的串行），所以当取得的`上次写 buffer 前的开始时间`不为 0 的话，则表示上次写 buffer 处理还没有完成（或者也可能是`上 n 次写 buffer 处理`没有完成）。如果这个时间很大的话，就表示 写 page cache 繁忙。
+- 因为`写消息到 buffer`处理是一个串行处理（使用阻塞或非阻塞锁保证的串行），所以当取得的`上次写 buffer 前的开始时间`不为 0 的话，则表示上次写 buffer 处理还没有完成（或者也可能是`上 n 次写 buffer 处理`没有完成）。如果这个时间很大的话，就表示 写 page cache 繁忙。如果上次写 buffer 处理已经完成，`上次写消息设置的开始时间`为 0 的话，那么`当前系统时间 - 上次写消息设置的开始时间`就不在`指定区间内`，就算是不繁忙。
 - 为什么写 buffer 很长时间没有完成，就表示写 page cache 繁忙呢？因为写处理使用的是 mmap 方式，这种方式减少了数据复制到`用户空间（也就是 jvm）`这个步骤，但是减少不了数据写内核内存的步骤（也就是到 page cache 的步骤，因为 page cache 就是 mmap 使用的那些内核内存）。page cache 满了的话，存在交换和清理的操作；如果没有满，可能存在 page fault 的操作，这些都可能影响 page cache 写的性能。另外，写 buffer 只是向内存里写，还没有向磁盘上写，所以这里不涉及磁盘性能影响的问题。
 
 ```
@@ -612,7 +612,9 @@ class DefaultAppendMessageCallback implements AppendMessageCallback {
 
         final int propertiesLength = propertiesData == null ? 0 : propertiesData.length;
 
-        // 如果剩余空间不够保存消息，就用空间消息把剩余空间写满
+        // 如果“消息长度+空白消息长度 > 剩余空间”，说明保存当前消息后，
+        // 剩余空间不够保存一个空白消息体，所以把当前剩余空间都保存成空白。
+        // 然后把当前消息保存到下一个文件中。
         // Determines whether there is sufficient free space
         if ((msgLen + END_FILE_MIN_BLANK_LENGTH) > maxBlank) {
             this.resetByteBuffer(this.msgStoreItemMemory, maxBlank);
@@ -679,7 +681,7 @@ class DefaultAppendMessageCallback implements AppendMessageCallback {
  - 使用 writeBuffer 来保存消息
  - 使用 CommitRealTimeService 把 writeBuffer 里的数据“异步”写进 fileChannel 中，再把 fileChannel 里的数据刷到磁盘上。
 
-| FlushDiskType(条件1) | transientStorePoolEnable(条件2) | 使用的刷盘类 | 刷盘Buffer |
+| FlushDiskType(条件1) | transientStore(条件2) | 使用的刷盘类 | 刷盘Buffer |
 |----------|--:|:--:|---|
 | true | false | GroupCommitService | mappedByteBuffer |
 | false | false | FlushRealTimeService | mappedByteBuffer |
@@ -772,7 +774,7 @@ public void run() {
 
 下面让我们分析一下代码，首先是`waitForRunning(10)`，这个方法是做什么的呢？
 
-- 如果有消息在等待队列 (requestWrite) 里准备落盘，就交换两个队列。
+- 如果没有消息进来时，防止 GroupCommitService 不停地空转浪费 CPU，所以让此线程暂停等待。当有消息进来时，就会立刻唤醒 GroupCommitService。
 - 如果没有消息准备落盘，就等待 10ms，然后再交换两个队列。（即使没有消息进来，也要交换两个队列。只是在刷盘时候，看队列里没有消息就直接返回了）
 
 ```
@@ -996,22 +998,23 @@ ReferenceResource 是一个引用计数类，表示当前类“有几个地方�
 从使用上来看，这个类的作用应该是保证在 broker 进行 shutdown 时候，停止刷盘工作。还有就是在关闭和删除 MappedFile 时候使用。
 
 下面是文章 [rocket mq 底层存储源码分析(1)-存储总概](https://www.jianshu.com/p/f01534f21b71) 对 ReferenceResource 的解释：
-
+>
 这里在说一下MappedByteBuffer，可能会导致JVM crash ,因为MappedByteBuffer可以通过特殊的方法释放，实际上调用了unmap的方法。此时，之前映射到jvm的地址空间就是非法地址，如果此后仍然对MappedByteBuffer进行读写，系统就会向jvm发送sigbus信号来通知进程非法操作，这个问题一般是由于程序没有处理好并发问题导致的。
-
+>
 因此rmq通过引用计数法，即只要引用计数不为0,MappedByteBuffer对象就不会释放来解决这个问题。具体的抽象实现为ReferenceResource，使用AtomicLong原子变量来保证并发，性能上会比较好。
-
+>
 当然，这种方式也会存在弊端，就是程序不能正确操作引用计数，可能会导致文件无法删除，因此，rmq增加了一个补救措施，就是一旦文件被关闭了状态位available会设置为false，并且开始计时，如果超过2分钟，引用计数还没有变为0，就强行释放。上文提到，MappedByteBuffer会在jvm发生gc时，可能被回收，但不是一定，rmq通过反射的方式调用Cleaner.clean，手动清除。
-
+>
 DirectByteBuffer本身是一个java heap内的对象，自身所占用的内存并不会很大，只是其实例所映射的堆外内存可能会比较大，当jvm发起young gc时，如果DirectByteBuffer实例是非可达性对象，那么，jvm就会将DirectByteBuffer实例回收，在回收前，会通过Cleaner.clean方法，委托Deallocator释放堆外内存；但DirectByteBuffer经过多次ygc后，会晋升到老年代，此时，如果不通过full gc 或old gc,就无法释放堆外内存；因此我们可以通过程序手动释放。
-
+>
 Cleaner是 PhantomReference虚引用的子类，并通过自身的next和prev字段维护的一个双向链表。PhantomReference的作用在于跟踪垃圾回收过程，并不会对对象的垃圾回收过程造成任何的影响。
 所以cleaner = Cleaner.create(this, new Deallocator(base, size, cap)); 用于对当前构造的DirectByteBuffer对象的垃圾回收过程进行跟踪。
 当DirectByteBuffer对象从pending状态 ——> enqueue状态时，会触发Cleaner的clean()，而Cleaner的clean()的方法会实现通过unsafe对堆外内存的释放。
 
 
 <br>
-2，异步刷盘
+**2，异步刷盘**
+**FlushRealTimeService**
 FlushRealTimeService 是一个异步刷盘类，也是对 mappedByteBuffer 或 writeBuffer 里的内容进行刷盘操作。当 transientStorePoolEnable 为 false 时候，对 mappedByteBuffer 里的内容进行刷盘；为 true 时，对 writeBuffer 进行刷盘。这个异步刷盘类主要逻辑就是：
 
 - 如果是“定时”异步刷盘，就等待一定时间后，进行刷盘。等待时，不可中断（这个中断是指 RocketMQ 实现的一种自定义的中断，不是指线程中断）
@@ -1020,11 +1023,19 @@ FlushRealTimeService 是一个异步刷盘类，也是对 mappedByteBuffer 或 w
 这个异步刷盘类，也是对 mappedByteBuffer 里的内容进行刷盘操作。
 
 
+**CommitRealTimeService**
 CommitRealTimeService 这个异步刷盘类，这个类是对 writeBuffer 里的内容进行刷盘操作。这个刷盘类处理有点不一样，在这个类中把 writerBuffer 的数据写到 fileChannel 中，但刷盘处理，是调用的 FlushRealTimeService 进行的刷盘。
 
 - 首先把 writeBuffer 里的内容写到 fileChannel 里
 - 然后调用 FlushRealTimeService 进行异步刷盘
 - 最后等待一定时间（这个等待也是可中断的）
+
+<br>
+CommitRealTimeService 把消息写到 fileChannel 上，也有一定条件（就像 GroupCommitService 每 10ms 写一次）。具体条件如下：
+- 如果写的消息大于 4 个系统页大小。（每个系统页大小，默认为 4096 Byte）。
+- 如果距离上次写操作，已经过去 200ms。
+
+每个消息来到时，都会 wakeup CommitRealTimeService。如果符合上面的条件，就进行写消息；如果不符合，CommitRealTimeService 就再次进行等待状态。
 
 
 
@@ -1044,8 +1055,8 @@ CommitRealTimeService 这个异步刷盘类，这个类是对 writeBuffer 里的
 不管是 DirectBuffer 方式还是 MMAP 方式，在`第一次`写数据时都要产生 page fault 来建立`虚拟内存`和`物理内存`映射关系。第二次写时，因为映射已经创建好了，所以就不会产生 page fault 了（前提是内存够大，不需要因为内存紧张把 page cache 移除）。而第二次写，也就是真正储存消息时，进行的写操作。
 > 说一下 page fault。CPU 所作的一切运算，都是通过 CPU 缓存间接与内存进行操作的。若是 CPU 请求的内存数据在物理内存中不存在，那么 CPU 就会报告「缺页错误（Page Fault）」。发生 page fault 后，就会把数据读到内存中，然后建立映射，让 CPU 能正常访问数据。所以不管是 DirectBuffer 方式还是 MMAP 方式，在第一次进行写数据时，都会发生 page fault。
 
-**还有一段处理，在 MMAP 时候如果写满后，进行刷盘。为什么 MMAP 时候进行刷盘，而 DirectBuffer+Channel 时候不进行刷盘呢？**
-这里的猜测是，因为 MMAP 在写完数据后不进行刷盘的话，在一定条件下 linux 的 pdflush 进程会对数据进行刷盘操作。如果在真正写消息时，pdflush 才进行刷盘的话会影响性能，所以提前进行刷盘。DirectBuffer+Channel 的话，因为 DirectBuffer 没有和 Channel 或 文件有绑定关系，所以 DirectBuffer 只是一块大的内存，不会被 pdflush 刷盘，所以不用在写满后刷盘。
+~~**还有一段处理，在 MMAP 时候如果写满后，进行刷盘。为什么 MMAP 时候进行刷盘，而 DirectBuffer+Channel 时候不进行刷盘呢？**
+这里的猜测是，因为 MMAP 在写完数据后不进行刷盘的话，在一定条件下 linux 的 pdflush 进程会对数据进行刷盘操作。如果在真正写消息时，pdflush 才进行刷盘的话会影响性能，所以提前进行刷盘。DirectBuffer+Channel 的话，因为 DirectBuffer 没有和 Channel 或 文件有绑定关系，所以 DirectBuffer 只是一块大的内存，不会被 pdflush 刷盘，所以不用在写满后刷盘。~~
 
 **“预热”动作(2)：防止 GC**
 warmMappedFile 方法中有一段代码：
@@ -1085,6 +1096,7 @@ mlock 方法中，使用的代码块语法，不知道为什么要使用这种�
 
 ###3，关于 xxxPosition 的作用和使用方法
 在进行写数据和刷盘时，使用了几个 position 属性来记录写数据和刷盘的位置。下面对几个 position 进行总结一下：
+
 |    Position    | MMAP | Direct+<br>Chan | 所属类 | 作用 |
 |----------|--:|:--:|---|---|
 | wrotePosition | O | O | MappedFile | 这个变量是在把消息写到 buffer 时候使用。就是指写消息时，写到 buffer 哪个位置了。这个位置不代表被写的消息已经被刷新到磁盘了，只是告诉你，写下一个消息时从哪开始。<br>MMAP 和 DirectBuffer+Channel 在写消息时，都使用这个 position。|
@@ -1129,7 +1141,7 @@ isOSPageCacheBusy 方法是用来判断写消息到 buffer 操作是否繁忙。
 另外，如果要加快读写速度的话，还可以在以下方面进行优化：
 
 - 1，调整 Linux I/O 调度器。NOOP、DeadLine 等调试方式在不同的磁盘和不同的工作场景，效果都不同。
-- 2，使用的磁盘类型（SATA 或 SSD）和 单线程/多线程读写都有关系，可以参考：[聊聊Linux IO](http://0xffffff.org/2017/05/01/41-linux-io/)。（虽然 RocketMQ 写是同步写，但还是可以看看）
+- 2，使用的磁盘类型（SATA 或 SSD）和 单线程/多线程读写都有关系，可以参考：[聊聊Linux IO](http://0xffffff.org/2017/05/01/41-linux-io/)。
 - 3，使用不同的算法。LSM-Tree 的设计便是合理的利用了存储介质的特性，做到了最大化的性能利用（磁盘换成SSD也依旧能有很好的运行效率）。
 - 4，可以试试`快速预分配磁盘空间`，即虽然文件没有写满，但先把文件和所占用创建出来(应该用 fallocate)。好处参考：[lseek, fallocate来快速创建一个空洞文件，lseek不占用空间，fallocate占用空间(快速预分配)](https://yq.aliyun.com/articles/11244)
   * （1）可以让文件尽可能的占用连续的磁盘扇区，减少后续写入和读取文件时的磁盘寻道开销；

@@ -19,16 +19,18 @@ Broker分组 = Master节点x1 + Slave节点xN。
 目前官方提供三套配置：
 
 2m-2s-async
+
 | brokerClusterName | brokerName | brokerRole | brokerId |
-| -- | -- | -- | -- |
+|---|---|---|---|
 | DefaultCluster | broker-a | ASYNC_MASTER | 0 |
 | DefaultCluster | broker-a | SLAVE | 1 |
 | DefaultCluster | broker-b | ASYNC_MASTER | 0 |
 | DefaultCluster | broker-b | SLAVE | 1 |
 
 2m-2s-sync
+
 | brokerClusterName | brokerName | brokerRole | brokerId |
-| -- | -- | -- | -- |
+|---|---|---|---|
 | DefaultCluster | broker-a | SYNC_MASTER | 0 |
 | DefaultCluster | broker-a | SLAVE | 1 |
 | DefaultCluster | broker-b | SYNC_MASTER | 0 |
@@ -37,14 +39,14 @@ Broker分组 = Master节点x1 + Slave节点xN。
 2m-noslave
 
 | brokerClusterName | brokerName | brokerRole | brokerId |
-| -- | -- | -- | -- |
+|---|---|---|---|
 |DefaultCluster | broker-a | ASYNC_MASTER | 0 |
 |DefaultCluster | broker-b | ASYNC_MASTER | 0 |
 
 ##4，传输内容
 
 | 对象 | 用途 | 第几位 | 字段 | 数据类型 | 字节数 | 说明 |
-| -- | -- | -- | -- | -- | -- | -- |
+|---|---|---|---|---|---|---|
 | Slave=>Master | 上报CommitLog已经同步到的物理位置 | 0 | maxPhyOffset | Long | 8 | CommitLog最大物理位置 |
 | Master=>Slave | 传输新的 CommitLog 数据 | 0 | fromPhyOffset | Long | 8 | CommitLog开始物理位置 |
 | - | - | 1 | size | Int | 4 | 传输CommitLog数据长度 |
@@ -167,6 +169,7 @@ AcceptSocketService 方法是用来接收并创建 Slave 来的连接的，然�
 
 - beginAccept：负责生成 NIO 的 Selector 和 ServerSocketChannel。
 - run：接收 Slave 的连接创建请求，创建 HAConnection。
+
 ```
 public void beginAccept() throws Exception {
     this.serverSocketChannel = ServerSocketChannel.open();
@@ -1002,7 +1005,7 @@ RocketMQ 的 Slave 是同步或异步保存，是需要修改 broker 配置的�
 
 
 | 条件 | 结果 |
-| -- | -- |
+|---|---|
 | Slave 保存成功，回传 offset 因为网络问题丢失 | 消息同步等待机制，在没有其它消息继续传时候，会最多等待 5 秒。一般来说 5 秒之内 TCP 重传机制已经把丢失的数据重传了。如果有其它消息继续传，那其因为它消息返回的 offset 也可以确认当前消息。|
 | Slave 保存成功，回传 offset 时失败，失败后 Master 挂了 | 这种情况下 cosnumer 变成从 Slave 消费了，可能会消费到`发送失败的消息`。|
 | Slave 保存成功后，Slave 机器机器挂掉 | 这种情况下，如果 Slave 不能在短时间内启动起来，那消息同步就失败。但从现在实现来看，就算 Slave 同步失败，也算消息保存成功。|

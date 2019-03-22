@@ -52,6 +52,17 @@ sst_6
 最后再把最大的`sequence number`设置到系统上，在插入时使用。
 
 
+
+## 几种意外情况
+下面是几种意外情况的总结，这几种情况没有看过源码，是自己推断的。
+
+1. 日志写完，immemtable 写成 sstable 前，进程死掉。
+
+2. 日志写完，sstable 生成后，写到 manifest 文件前，进程死掉。（或 compaction 后，写到 manifest 文件前死掉）
+
+3. 日志写完，sstable 生成后，写入 manifest 文件后，删除日志文件前，进程死掉。
+
+
 # 参考：
 - [leveldb:数据库recover机制 - weixin_36145588的博客 - CSDN博客](https://blog.csdn.net/weixin_36145588/article/details/78029415)
 

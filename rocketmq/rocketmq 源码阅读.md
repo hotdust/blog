@@ -38,7 +38,7 @@ public class TopicPublishInfo {
 }
 ```
 
-##3，MeesageQueue
+##3，MessageQueue
 像 kafka 中的 partition，即一个 Topic 被分成多少个 Queue。
 ```
 public class MessageQueue implements Comparable<MessageQueue>, Serializable {

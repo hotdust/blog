@@ -38,6 +38,8 @@ ScheduleMessageService 是关于延迟消息的 service。它启动时，会对�
 ###（1）关于延迟消息的`计划消费时间`
 当定时任务启动后，判断延迟消息是否到达了`计划消费时间`时，这个`计划消费时间`是从 tagsCode 属性里取得的。tagsCode 应该保存的是 tags，为什么从这里取得`计划消费时间`呢？因为在把消息写完后，在写到 consume queue 之前，把 tagsCode 属性设置成了`计划消费时间`（在`CommitLog#checkMessageAndReturnSize`方法里做的）。而原本的 tagsCode 被当成属性保存到消息里了。
 
+`计划消费时间`是一个绝对时间，是由 `broker 当前时间 + 延迟时间`组合而成的。
+
 ###（2）如果 client 指定的 delay level 在 broker 不存在怎么办？
 如果 client 指定的 delay level 在 broker 不存在，把 delay level 设置成`最大的delay level`。（在 CommitLog#putMessage 方法中做的）
 

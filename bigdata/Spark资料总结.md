@@ -485,6 +485,10 @@ spark.history.fs.cleaner.interval 1h
 
 但删除的比较慢。
 
+## 29，spark 启动失败，如何查看详细 log
+> yarn logs -applicationId application_1536581049061_0004
+
+
 参考：
 - [Spark History Server Automatic Cleanup – Hadoopsters](https://hadoopsters.net/2016/10/27/spark-history-server-automatic-cleanup/)
 - [Cleaning up Spark history logs - Stack Overflow](https://stackoverflow.com/questions/42817924/cleaning-up-spark-history-logs)

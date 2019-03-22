@@ -109,6 +109,8 @@ Lookup 和 Release 对 refs 的影响是(Insert 同 Lookup)：
 ![leveldb-cache](media/leveldb-cache.png)
 
 
+上图中，什么情况下会在 in_use 时调用 Erase 方法呢？在 kv 正在使用时，有一个对这个 kv 的删除操作，应该就会调用 Erase 方法。调用 Erase 方法，会把 cache 移出 in_use 队列，并且把 refs 减 1。在这之后 refs 为 1（2-1=1），不为 0，所以不能删除掉这个 cache。当使用的这个 cache 的地方使用完后，调用 release 方法后，会再把 refs 减 1，这时候 refs 为 0，才会真正的删除掉这个 cache。
+
 
 #### 2，什么时候清理 lru_
 每次 Insert 后，都会判断是否 usage_ > capacity。如果超过 capacity，就删除缓存，一起删除到小于 capactity。
@@ -152,7 +154,7 @@ LRUHandle 就是链表的结点。这个类用在两个地方：
 不会有这种情况，如果有这种情况的话，缓存基本上无法删除了。
 
 
-# 细节
+# 个人总结
 ## 1，两个缓存的关系
 注意，两个缓存虽然在存储上，存在不同的对象中，但两者是有关联的。简单的说，关联是：
 > 如果 Table Cache 中的缓存被删除了，Block Cache 中对应的 data_block 的缓存也就无法使用了。
@@ -171,10 +173,10 @@ LRUHandle 就是链表的结点。这个类用在两个地方：
 上面说是为了`多 client`，但 NewId 是在 sstable 打开时(Table::Open)创建的，如果多个 client 访问 Table 的话，使用的`唯一ID`应该都是相同的才对。
 
 
-## 3，关于代码的调用关系
+## 2，关于代码的调用关系
 Table 的内容的取得（InternalGet 和 NewIterator 方法；），基本上都是在 TableCache 中调用的（只有 dumpfile.cc 中直接调用了 Table::NewIterator 方法），可见 levelDB 的做法不是 Table 包含 TableCache，而是 TableCache 包含 Table。如果 Table 包含 TableCache 的话，外部使用类持有的 Table 的引用；而如果 TableCache 包含 Table 的话，外部使用有持有的是 TableCache 的引用。
 
-## 4，调用完 ShardedLRUCache 的 Lookup（或 Insert）方法后，何时调用 Release？
+## 3，调用完 ShardedLRUCache 的 Lookup（或 Insert）方法后，何时调用 Release？
 上面文中说了什么时候进行 refs++，在调用 Release 的时候才会调用 refs--。那什么时候会调用 Release 呢？调用 Release 的时候，会不会造成正在使用的缓存被删除掉了呢？
 
 总的说来，不管什么时候调用 Release，不能在`缓存正在被使用`的时候调用 Release，因为如果这个时候调用 Release，缓存就会被放回到 lru_ 链表中，就有可能随时被删除掉。这样使用时就可能出现`空指针`问题。所以一般会在下面的时刻调用 Release：
@@ -182,7 +184,7 @@ Table 的内容的取得（InternalGet 和 NewIterator 方法；），基本上�
 - 在使用缓存取得某个 Value，然后把 Value 复制一份后，会进行调用 Release。
 
 ### 代码执行过程
-在读取数据时，会返回一个 Iterator。在创建 Iterator 之后，返回 Iterator 之前，会注册一个 Iterator 的 Cleanup 函数（使用 RegisterCleanup 注册），函数的内容之中就包含了 Release 方法，Cleanup 函数会在 Iterator 销毁时被调用(delete iter)。也就是说当 Iterator 被使用完了，得到想得到的值后，就会使用 delete 方法销毁它，这时候 Cleanup 会被调用。下面是 Iterator.h 中关于 RegisterCleanup 方法的一段注释：
+在读取数据时，会返回一个 Iterator。在创建 Iterator 之后，返回 Iterator 之前，会注册一个 Iterator 的 Cleanup 函数（使用 RegisterCleanup 注册）。这个函数有点类似析构函数的意思，函数的内容之中就包含了 Release 方法，Cleanup 函数会在 Iterator 销毁时被调用(delete iter)。也就是说当 Iterator 被使用完了，得到想得到的值后，就会使用 delete 方法销毁它，这时候 Cleanup 会被调用。下面是 Iterator.h 中关于 RegisterCleanup 方法的一段注释：
 ```
 // Clients are allowed to register function/arg1/arg2 triples that
 // will be invoked when this iterator is destroyed.
@@ -191,7 +193,7 @@ Table 的内容的取得（InternalGet 和 NewIterator 方法；），基本上�
 例如：在 Table 的 InternalGet 方法中，会先用 BlockReader 取得 Iterator，然后使用它查找值，找到后就保存到参数中，然后销毁 Iterator。
 
 
-## 5，什么时候删除 LRUCache 呢？如何删除呢？
+## 4，什么时候删除 LRUCache 呢？如何删除呢？
 上面说到，在 Iterator 创建时候，会注册一个 Cleanup 函数（调用 RegisterCleanup 进行注册），在销毁 Iterator 时会调用这个函数。在创建 LRUHandle 时，也会为它设置一个删除函数，这个函数叫 deleter。这个函数也会在 Unref 方法中可能会被调用，每次减少 refs 时，都会看一下是否为 0，如果为 0 就调用 deleter 函数，来删除这个缓存。
 
 和 Iterator 不太相同的是：
@@ -199,10 +201,10 @@ Table 的内容的取得（InternalGet 和 NewIterator 方法；），基本上�
 - LRUCache：在删除时，需要主动调用 deleter 函数。
 
 
-## 6，为什么要使用 lru_ 和 in_use_ 两个链表呢？使用一个链表行不行？
+## 5，为什么要使用 lru_ 和 in_use_ 两个链表呢？使用一个链表行不行？
 不行的。举个例子，如果只使用一个链表的话，在查找 key 是否在 data_block 时，可能因为 lru_ 满了，对 lru 删除操作同时进行。如果想正在使用的缓存不被删除，只能使用锁的方式，把缓存锁保护起来，但这样就造成了不能删除问题。
 
-所以，把正在使用的缓存放到另一个链表中，避免锁和空指针问题。
+把正在使用的缓存放到另一个链表中只是其中一点，还有重要的一点是，in_use 链表中的缓存的 refs 都是再进行 +1 的，也就是 2。所以一般都就算被从 in_use 中删除掉，refs 减 1，cache 也不会被立刻删除，只有在使用地方 release 后才可能真正删除。
 
 ## 7，删除 Table Cache 中的缓存后，Table 相应的 data_block 中的缓存删除吗？
 不会立刻删除，因为 Table 的析构函数里，没有删除 options 里的 data_block 的语句。
@@ -222,14 +224,13 @@ Table 的内容的取得（InternalGet 和 NewIterator 方法；），基本上�
 当 hash 值为 1 时，对于外层 hashmap，`1 % 4 = 1`分到 1 号桶中。对于内层 hashmap，`1 % 4 = 1`还是分到 1 号桶中。想一想，什么情况下数据会分到内层 hashmap 的 0 号桶中呢？没有可能，因为分桶策略都是一样的，2 和 3 号桶也是一样。
 
 
-# 个人总线：
-## 1，LRUCache 结构的优点
+## 9，LRUCache 结构的优点
 这个结构的优点：
 - 在查找时，从 HashMap 进行查找，时间复杂度为：O(n/(s1+s2))。n 为元素的个数，s1 为 LRU Cache 中的数组的个数，s2 为 HashMap 中数组的个数。
 - 删除时，从链表进行删除，时间复杂度为 O(1)。因为 1 次就可以定位要删除结点的开始结点。
 - 两个链表的插入时间复杂度基本上也是 O(1)，找到数组的结点后，把新元素放到第一个位置。
 
-## 2，关于`引用计数`
+## 10，关于`引用计数`
 使用`引用计数`的方式，主要是怕缓存在使用中时候，被销毁掉，造成空指针问题。如果不使用`引用记数`的方式的话，无法知道当前有多少个地方正在使用缓存。
 
 **如何使用`引用计数`呢？**
@@ -240,7 +241,18 @@ Table 的内容的取得（InternalGet 和 NewIterator 方法；），基本上�
 1. 可以在要删除时，把引用减 1，然后判断是否还`引用==0`。如果为 0 说明没有地方再引用它了，就删除掉；如果不为 0，就先不管了。
 2. 每个地方在使用完这个缓存后，做一次 1 中的`把引用减 1，然后判断 引用==0 ...`的操作。
 
+## 11，为什么使用“两层 Hashmap”？
+1. 为了查找速度快。桶的个数越多，查找速度相对越快。而且，目标是“每个桶装只一个元素”。
+2. 为了 resize 影响小。如果只使用一个 Hashmap，如果要进行 resize 的话，需要把整个 Hashmap 都锁住，这样 cache 就不能使用了。如果使用两层 Hashmap 的话，进行 resize 时只是锁住下面那层的某个 Hashmap，然后进行 resize，这样不需要锁住整个 cache。
 
+## 12，对于 resize 方法的实现。
+在 levelDB 中，对 cache 进行 resize 时，过程如下：
+- 增加一个 cache 后，判断是否需要进行 recache。
+- 如果需要，是新建一个是原来大小两倍的 hashmap，然后循环把 cache 一个一个移动过去。
+
+还一个方案，当 Hashmap 中的内容比较多时，可以使用 redis 的方案试试。即创建`新的Hashmap`后，不一次把所有 key 都移动过去，当有`增删改查`操作时，对相对应的 key 进行移动。这两个方案相比较来看，在对某个底层的 Hashmap 进行`增删改查`操作时，都需要进行锁处理。所以不存在一个需要锁，别一个不需要锁的情况。
+
+还有一个`Dynamic-Sized Nonblocking Hash Tables`，这个 HashTable 是 lock-free、wait-free 的，还可以随着 table 里元素的增减，进行伸缩。
 
 # 参考：
 - [缓存系统 — leveldb-handbook 文档](https://leveldb-handbook.readthedocs.io/zh/latest/cache.html)：用文字和图的方式详解 LRUCache。但其中说这个 LRU Cache 是核心部分是参照《Dynamic-Sized Nonblocking Hash Table》做的，但感觉不太像，而且论文的时间是 2014 年，

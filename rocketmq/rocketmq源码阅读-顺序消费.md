@@ -176,6 +176,8 @@ ConsumeRequest 的 run 方法运行完，同步处理也就结束了。所以`�
 （2）takeMessags 和 makeMessageToCosumeAgain 方法
 这两方法一个是从 msgTreeMap 取得要消费的消息放到 msgTreeMapTemp 里，另一个是把 msgTreeMapTemp 里的消费放回到 msgTreeMap 里。都是只在顺序消费时使用的方法。
 
+（3）msgTreeMap 是一个优先级 Map，排序的方式是以 offset 进行排序的。因为是顺序消费，所以要以 offset 进行排序。
+
 <br>
 5，RebalanceLockManager 类
 这个类是工作在 Broker 端的类。这个类的主要作用是，记录哪些 queue 被哪些 client 给锁住了。信息都是保存在内存中。
@@ -209,6 +211,8 @@ ConsumeRequest 的 run 方法运行完，同步处理也就结束了。所以`�
 例如：topic 有 64 个 queue，如果使用 64 个线程，就可以同时处理这 64 个 queue 的顺序消费。如果像 kafka 一样只使用一个 partition 的话，一个 consumer 只能顺序消息一个 partition。如果使用多线程处理 partition 里的数据的话，有可能造成乱序问题。
 
 3，对于顺序消息，即使有多台 Master，可能保证只向一台 Master 中发数据。
+
+4，
 
 问题：
 1，processConsumeResult 中如果不是 autoCommit的时候，status 是 SUCCESS 的话，什么也不做。如果不进行 commit 的话，msgTreeMapTemp 是无法清空的。下次再从 msgTreeMap 里向 msgTreeMapTemp 里写消息时，前面消费过的消费还在，就重复消费了。那用户什么时候可以进行 commit 呢？

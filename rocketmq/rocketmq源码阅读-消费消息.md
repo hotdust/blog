@@ -374,11 +374,12 @@ DefaultMQPushConsumerImpl#start
 分配结果如下：
 
 | - | Consumer 2 可以整除* |	Consumer 3 不可整除* | Consumer 5 无法都分配* |
-| - | - | - | - |
+|---|---|---|---|
 |消息队列[0] | Consumer[0] | Consumer[0] | Consumer[0] |
 | 消息队列[1] | Consumer[0] | Consumer[0] | Consumer[1] |
 | 消息队列[2] | Consumer[1] | Consumer[1] | Consumer[2] |
 | 消息队列[3] | Consumer[1] | Consumer[2] | Consumer[3] |
+
 引用：[RocketMQ 源码分析 —— Message 拉取与消费（下）](http://www.iocoder.cn/RocketMQ/message-pull-and-consume-second/)
 
 下面说一下代码：
@@ -428,7 +429,7 @@ range 是每个 client 要消费的 queue 的个数。没进行严格举例，�
 分配结果如下：
 
 | - | Consumer 2 可以整除* |	Consumer 3 不可整除* | Consumer 4,5 无法都分配* |
-| - | - | - | - |
+|---|---|---|---|
 |消息队列[0] | Consumer[0] | Consumer[0] | Consumer[0] |
 | 消息队列[1] | Consumer[1] | Consumer[1] | Consumer[1] |
 | 消息队列[2] | Consumer[0] | Consumer[2] | Consumer[2] |
@@ -560,9 +561,16 @@ RocketMQ 有两种方式取得消息：Push 和 Pull。但实现方式上，都�
 ###（3）消息如何放到 retry topic 中
 `SendMessageProcessor#consumerSendMsgBack` 方法是处理`返回到 broker 的消息`的。因为是返回给 broker 的消息，所以认为这些消息都是重试消息。如果消息超时重试最大次数，就放到死信队列中；如果没超过，就根据设置放到对应的延迟队列中。所以重试消息不是直接放到对应的`retry topic`中，而是放到延迟队列中。延迟消息到时间后，再从延迟队列取出，放到相应的 retry topic 中。
 
+## 10，消息拉取过多
+消息在拉取之后，调用`消息处理`方法后，就再发`拉取请求`。因为`消息处理`是异步处理，所以这`消息处理`和`拉取请求`几乎是同时发生，并不是处理完后，再去拉取。
+
+如果这样一直拉取，一定会把 consumer 内存装满，那 RocketMQ 是怎么做的呢？
+
+在拉取时，有一个`最小拉取时间`，大于这个间隔才会拉取消息。在这之上，还会判断现在 consumer 没有消费完的消息的个数，如果个数大于指定值，就会过一会再去拉取。（这里是调用 executePullRequestLater 方法，在指定时间后，再发一个拉取请求。）
 
 
-##10，string2File 和 string2FileNotSafe
+
+## 11，string2File 和 string2FileNotSafe
 这两个方法是用来写文件的，第一个方法是安全的，第二个方法是不安全的。为什么第二个方法是不安全的呢？
 
 OS和磁盘读写的基本单位是块，也可以称之为(page size)block size，OS的块则一般为4K；IO块则更小，linux内核要求IO block size<=OS block size。磁盘IO除了IO block size，还有一个概念是扇区(IO sector)，扇区是磁盘物理操作的基本单位，而IO 块是磁盘操作的逻辑单位，一个IO块对应一个或多个扇区，扇区大小一般为512个字节。
@@ -583,7 +591,7 @@ OS和磁盘读写的基本单位是块，也可以称之为(page size)block size
 
 
 #特点： 
-1，DefaultMessageStore#checkInDiskByCommitOffset 来检查消息是在内存中，还是在磁盘上。判断逻辑是：未消费的消息字节数，是不是超过物理内存的 40%。如果超过了，有一部分消息就是在磁盘中了；如果没有，那消息就全部在内存中。这个逻辑如果在一般环境中（一台机器只有 RocketMQ，没有其它服务或中间件），可能还是可行的
+1，DefaultMessageStore#  来检查消息是在内存中，还是在磁盘上。判断逻辑是：未消费的消息字节数，是不是超过物理内存的 40%。如果超过了，有一部分消息就是在磁盘中了；如果没有，那消息就全部在内存中。这个逻辑如果在一般环境中（一台机器只有 RocketMQ，没有其它服务或中间件），可能还是可行的
 个人想了一下，使用内存的地方可能如下：（现在对 RocketMQ 的整体还不太了解，可能不准确）
 
 1. 启动 rocketmq 的 jvm 内存。记得官方推荐 16G 内存的机器，runbroker.sh 里默认是 8G。这样的内存就剩下 50%了。
